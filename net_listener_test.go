@@ -14,7 +14,6 @@
 // limitations under the License.
 
 //go:build darwin || netbsd || freebsd || openbsd || dragonfly || linux
-// +build darwin netbsd freebsd openbsd dragonfly linux
 
 package anet
 
@@ -81,7 +80,7 @@ func TestListenerDialer(t *testing.T) {
 		conn.SetOnRequest(onRequest)
 
 		MustNil(t, err)
-		n, err := conn.Write([]byte(msg))
+		n, err := conn.Write(msg)
 		MustNil(t, err)
 		Equal(t, n, len(msg))
 		time.Sleep(10 * time.Millisecond)
@@ -92,21 +91,21 @@ func TestListenerDialer(t *testing.T) {
 	}
 }
 
-// func TestConvertListener(t *testing.T) {
-// 	network, address := "unix", "mock.test.sock"
-// 	ln, err := net.Listen(network, address)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	udsln, _ := ln.(*net.UnixListener)
-// 	// udsln.SetUnlinkOnClose(false)
+func TestConvertListener(t *testing.T) {
+	network, address := "unix", "mock.test.sock"
+	ln, err := net.Listen(network, address)
+	if err != nil {
+		panic(err)
+	}
+	udsln, _ := ln.(*net.UnixListener)
+	// udsln.SetUnlinkOnClose(false)
 
-// 	nln, err := ConvertListener(udsln)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// 	err = nln.Close()
-// 	if err != nil {
-// 		panic(err)
-// 	}
-// }
+	nln, err := ConvertListener(udsln)
+	if err != nil {
+		panic(err)
+	}
+	err = nln.Close()
+	if err != nil {
+		panic(err)
+	}
+}

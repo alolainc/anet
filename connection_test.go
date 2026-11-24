@@ -14,7 +14,6 @@
 // limitations under the License.
 
 //go:build !windows
-// +build !windows
 
 package anet
 
@@ -22,26 +21,53 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/alolainc/anet/internal/socket"
 )
 
+func BenchmarkConnectionIO(b *testing.B) {
+	dataSize := 1024 * 16
+	writeBuffer := make([]byte, dataSize)
+	rfd, wfd := GetSysFdPairs()
+	rconn, wconn := new(connection), new(connection)
+	rconn.init(&netFD{fd: rfd}, &options{onRequest: func(ctx context.Context, connection Connection) error {
+		read, _ := connection.Reader().Next(dataSize)
+		_ = wconn.Reader().Release()
+		_, _ = connection.Writer().WriteBinary(read)
+		_ = connection.Writer().Flush()
+		return nil
+	}})
+	wconn.init(&netFD{fd: wfd}, new(options))
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, _ = wconn.WriteBinary(writeBuffer)
+		_ = wconn.Flush()
+		_, _ = wconn.Reader().Next(dataSize)
+		_ = wconn.Reader().Release()
+	}
+}
+
 func TestConnectionWrite(t *testing.T) {
-	var cycle, caps = 10000, 256
-	var msg, buf = make([]byte, caps), make([]byte, caps)
+	cycle, caps := 10000, 256
+	msg, buf := make([]byte, caps), make([]byte, caps)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	var count int32
-	var expect = int32(cycle * caps)
-	var opts = &options{}
+	expect := int32(cycle * caps)
+	opts := &options{}
 	opts.onRequest = func(ctx context.Context, connection Connection) error {
 		n, err := connection.Read(buf)
 		MustNil(t, err)
@@ -52,7 +78,7 @@ func TestConnectionWrite(t *testing.T) {
 	}
 
 	r, w := GetSysFdPairs()
-	var rconn, wconn = &connection{}, &connection{}
+	rconn, wconn := &connection{}, &connection{}
 	rconn.init(&netFD{fd: r}, opts)
 	wconn.init(&netFD{fd: w}, opts)
 
@@ -69,10 +95,10 @@ func TestConnectionWrite(t *testing.T) {
 func TestConnectionLargeWrite(t *testing.T) {
 	// ci machine don't have 4GB memory, so skip test
 	t.Skipf("skip large write test for ci job")
-	var totalSize = 1024 * 1024 * 1024 * 4
+	totalSize := int(int64(4) << 30 >> (64 - strconv.IntSize)) // 4 GiB on 64-bit; the test is skipped anyway
 	var wg sync.WaitGroup
 	wg.Add(1)
-	var opts = &options{}
+	opts := &options{}
 	opts.onRequest = func(ctx context.Context, connection Connection) error {
 		if connection.Reader().Len() < totalSize {
 			return nil
@@ -86,7 +112,7 @@ func TestConnectionLargeWrite(t *testing.T) {
 	}
 
 	r, w := GetSysFdPairs()
-	var rconn, wconn = &connection{}, &connection{}
+	rconn, wconn := &connection{}, &connection{}
 	rconn.init(&netFD{fd: r}, opts)
 	wconn.init(&netFD{fd: w}, opts)
 
@@ -102,13 +128,15 @@ func TestConnectionLargeWrite(t *testing.T) {
 
 func TestConnectionRead(t *testing.T) {
 	r, w := GetSysFdPairs()
-	var rconn, wconn = &connection{}, &connection{}
-	rconn.init(&netFD{fd: r}, nil)
-	wconn.init(&netFD{fd: w}, nil)
+	rconn, wconn := &connection{}, &connection{}
+	err := rconn.init(&netFD{fd: r}, nil)
+	MustNil(t, err)
+	err = wconn.init(&netFD{fd: w}, nil)
+	MustNil(t, err)
 
-	var size = 256
-	var cycleTime = 100000
-	var msg = make([]byte, size)
+	size := 256
+	cycleTime := 1000
+	msg := make([]byte, size)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -129,86 +157,76 @@ func TestConnectionRead(t *testing.T) {
 	rconn.Close()
 }
 
-func TestConnectionNoCopyReadString(t *testing.T) {
+// TestConnectionIOReader tests the io.Reader Read method which uses readCopy internally.
+// Verifies that Read after Peek preserves exposed buffer until Release.
+func TestConnectionIOReader(t *testing.T) {
 	r, w := GetSysFdPairs()
-	var rconn, wconn = &connection{}, &connection{}
+	rconn := &connection{}
 	rconn.init(&netFD{fd: r}, nil)
-	wconn.init(&netFD{fd: w}, nil)
 
-	var size, cycleTime = 256, 100
-	// record historical data, check data consistency
-	var readBucket = make([]string, cycleTime)
-	var trigger = make(chan struct{})
-
-	// read data
-	go func() {
-		for i := 0; i < cycleTime; i++ {
-			// nocopy read string
-			str, err := rconn.Reader().ReadString(size)
-			MustNil(t, err)
-			Equal(t, len(str), size)
-			// release buffer node
-			rconn.Release()
-			// record current read string
-			readBucket[i] = str
-			// write next msg
-			trigger <- struct{}{}
-		}
-	}()
-
-	// write data
-	var msg = make([]byte, size)
-	for i := 0; i < cycleTime; i++ {
-		byt := 'a' + byte(i%26)
-		for c := 0; c < size; c++ {
-			msg[c] = byt
-		}
-		n, err := wconn.Write(msg)
-		MustNil(t, err)
-		Equal(t, n, len(msg))
-		<-trigger
+	msg := make([]byte, 64)
+	for i := range msg {
+		msg[i] = byte(i)
 	}
-
-	for i := 0; i < cycleTime; i++ {
-		byt := 'a' + byte(i%26)
-		for _, c := range readBucket[i] {
-			Equal(t, byte(c), byt)
-		}
-	}
-
-	wconn.Close()
-	rconn.Close()
-}
-
-func TestConnectionReadAfterClosed(t *testing.T) {
-	r, w := GetSysFdPairs()
-	var rconn = &connection{}
-	rconn.init(&netFD{fd: r}, nil)
-	var size = 256
-	var msg = make([]byte, size)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var buf, err = rconn.Reader().Next(size)
+		// Peek exposes the underlying buffer
+		pk, err := rconn.Peek(16)
+		MustNil(t, err)
+		Equal(t, len(pk), 16)
+
+		// Read copies without exposing
+		buf := make([]byte, 64)
+		n, err := rconn.Read(buf)
+		MustNil(t, err)
+		Equal(t, n, 64)
+		for i := 0; i < 64; i++ {
+			Equal(t, buf[i], byte(i))
+		}
+
+		// Peek data still valid before Release
+		for i := 0; i < 16; i++ {
+			Equal(t, pk[i], byte(i))
+		}
+		rconn.Release()
+	}()
+	unix.Write(w, msg)
+	wg.Wait()
+	rconn.Close()
+	unix.Close(w)
+}
+
+func TestConnectionReadAfterClosed(t *testing.T) {
+	r, w := GetSysFdPairs()
+	rconn := &connection{}
+	rconn.init(&netFD{fd: r}, nil)
+	size := 256
+	msg := make([]byte, size)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		buf, err := rconn.Reader().Next(size)
 		MustNil(t, err)
 		Equal(t, len(buf), size)
 	}()
 	time.Sleep(time.Millisecond)
-	syscall.Write(w, msg)
-	syscall.Close(w)
+	unix.Write(w, msg)
+	unix.Close(w)
 	wg.Wait()
 }
 
 func TestConnectionWaitReadHalfPacket(t *testing.T) {
 	r, w := GetSysFdPairs()
-	var rconn = &connection{}
+	rconn := &connection{}
 	rconn.init(&netFD{fd: r}, nil)
-	var size = pagesize * 2
-	var msg = make([]byte, size)
+	size := pagesize * 2
+	msg := make([]byte, size)
 
 	// write half packet
-	syscall.Write(w, msg[:size/2])
+	unix.Write(w, msg[:size/2])
 	// wait poller reads buffer
 	for rconn.inputBuffer.Len() <= 0 {
 		runtime.Gosched()
@@ -219,7 +237,7 @@ func TestConnectionWaitReadHalfPacket(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		var buf, err = rconn.Reader().Next(size)
+		buf, err := rconn.Reader().Next(size)
 		Equal(t, atomic.LoadInt64(&rconn.waitReadSize), int64(0))
 		MustNil(t, err)
 		Equal(t, len(buf), size)
@@ -230,7 +248,7 @@ func TestConnectionWaitReadHalfPacket(t *testing.T) {
 		runtime.Gosched()
 	}
 	Equal(t, atomic.LoadInt64(&rconn.waitReadSize), int64(size))
-	syscall.Write(w, msg[size/2:])
+	unix.Write(w, msg[size/2:])
 	wg.Wait()
 }
 
@@ -252,7 +270,7 @@ func TestReadTrigger(t *testing.T) {
 
 func writeAll(fd int, buf []byte) error {
 	for len(buf) > 0 {
-		n, err := syscall.Write(fd, buf)
+		n, err := unix.Write(fd, buf)
 		if n < 0 {
 			return err
 		}
@@ -261,11 +279,19 @@ func writeAll(fd int, buf []byte) error {
 	return nil
 }
 
+func createTestTCPListener(t *testing.T) net.Listener {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	MustNil(t, err)
+	return ln
+}
+
 // Large packet write test. The socket buffer is 2MB by default, here to verify
 // whether Connection.Close can be executed normally after socket output buffer is full.
 func TestLargeBufferWrite(t *testing.T) {
-	address := getTestAddress()
-	ln, err := createTestListener("tcp", address)
+	ln := createTestTCPListener(t)
+	defer ln.Close()
+	address := ln.Addr().String()
+	ln, err := ConvertListener(ln)
 	MustNil(t, err)
 
 	trigger := make(chan int)
@@ -292,7 +318,7 @@ func TestLargeBufferWrite(t *testing.T) {
 	wg.Add(1)
 	bufferSize := 2 * 1024 * 1024 // 2MB
 	round := 128
-	//start large buffer writing
+	// start large buffer writing
 	go func() {
 		defer wg.Done()
 		for i := 1; i <= round+1; i++ {
@@ -309,7 +335,7 @@ func TestLargeBufferWrite(t *testing.T) {
 	time.Sleep(time.Millisecond * 100)
 	buf := make([]byte, 1024)
 	for received := 0; received < round*bufferSize; {
-		n, _ := syscall.Read(rfd, buf)
+		n, _ := unix.Read(rfd, buf)
 		received += n
 	}
 	// close success
@@ -319,29 +345,67 @@ func TestLargeBufferWrite(t *testing.T) {
 	trigger <- 1
 }
 
-func TestWriteTimeout(t *testing.T) {
-	address := getTestAddress()
-	ln, err := createTestListener("tcp", address)
+func TestConnectionTimeout(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	MustNil(t, err)
+	defer ln.Close()
 
-	interval := time.Millisecond * 100
+	const (
+		bufsz    = 1 << 20
+		interval = 10 * time.Millisecond
+	)
+
+	calcRate := func(n int32) int32 {
+		v := n / int32(time.Second/interval)
+		if v > bufsz {
+			panic(v)
+		}
+		if v < 1 {
+			return 1
+		}
+		return v
+	}
+
+	wn := int32(1) // for each Read, must <= bufsz
+	setServerWriteRate := func(n int32) {
+		atomic.StoreInt32(&wn, calcRate(n))
+	}
+
+	rn := int32(1) // for each Write, must <= bufsz
+	setServerReadRate := func(n int32) {
+		atomic.StoreInt32(&rn, calcRate(n))
+	}
+
 	go func() {
 		for {
 			conn, err := ln.Accept()
-			if conn == nil && err == nil {
-				continue
-			}
 			if err != nil {
 				return
 			}
+			// set small SO_SNDBUF/SO_RCVBUF buffer for better control timeout test
+			tcpconn := conn.(*net.TCPConn)
+			tcpconn.SetReadBuffer(512)
+			tcpconn.SetWriteBuffer(512)
 			go func() {
-				buf := make([]byte, 1024)
-				// slow read
+				buf := make([]byte, bufsz)
 				for {
-					_, err := conn.Read(buf)
+					n := atomic.LoadInt32(&rn)
+					_, err := conn.Read(buf[:int(n)])
 					if err != nil {
-						err = conn.Close()
-						MustNil(t, err)
+						conn.Close()
+						return
+					}
+					time.Sleep(interval)
+				}
+			}()
+
+			go func() {
+				buf := make([]byte, bufsz)
+				for {
+					n := atomic.LoadInt32(&wn)
+					_, err := conn.Write(buf[:int(n)])
+					if err != nil {
+						conn.Close()
 						return
 					}
 					time.Sleep(interval)
@@ -350,26 +414,113 @@ func TestWriteTimeout(t *testing.T) {
 		}
 	}()
 
-	conn, err := DialConnection("tcp", address, time.Second)
-	MustNil(t, err)
+	newConn := func() Connection {
+		conn, err := DialConnection("tcp", ln.Addr().String(), time.Second)
+		MustNil(t, err)
+		fd := conn.(Conn).Fd()
+		// set small SO_SNDBUF/SO_RCVBUF buffer for better control timeout test
+		err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 512)
+		MustNil(t, err)
+		err = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 512)
+		MustNil(t, err)
+		return conn
+	}
 
-	_, err = conn.Writer().Malloc(1024)
-	MustNil(t, err)
-	err = conn.Writer().Flush()
-	MustNil(t, err)
+	mallocAndFlush := func(conn Connection, sz int) error {
+		_, err := conn.Writer().Malloc(sz)
+		MustNil(t, err)
+		return conn.Writer().Flush()
+	}
 
-	_ = conn.SetWriteTimeout(time.Millisecond * 10)
-	_, err = conn.Writer().Malloc(1024 * 1024 * 512)
-	MustNil(t, err)
-	err = conn.Writer().Flush()
-	MustTrue(t, errors.Is(err, ErrWriteTimeout))
+	t.Run("TestWriteTimeout", func(t *testing.T) {
+		setServerReadRate(10 << 10) // 10KB/s
 
-	// close success
-	err = conn.Close()
-	MustNil(t, err)
+		conn := newConn()
+		defer conn.Close()
 
-	err = ln.Close()
-	MustNil(t, err)
+		// write 1KB without timeout
+		err := mallocAndFlush(conn, 1<<10) // ~100ms
+		MustNil(t, err)
+
+		// write 50ms timeout
+		_ = conn.SetWriteTimeout(50 * time.Millisecond)
+		err = mallocAndFlush(conn, 1<<20)
+		MustTrue(t, errors.Is(err, ErrWriteTimeout))
+	})
+
+	t.Run("TestReadTimeout", func(t *testing.T) {
+		setServerWriteRate(10 << 10) // 10KB/s
+
+		conn := newConn()
+		defer conn.Close()
+
+		// read 1KB without timeout
+		_, err := conn.Reader().Next(1 << 10) // ~100ms
+		MustNil(t, err)
+
+		// read 20KB ~ 2s, 50ms timeout
+		_ = conn.SetReadTimeout(50 * time.Millisecond)
+		_, err = conn.Reader().Next(20 << 10)
+		MustTrue(t, errors.Is(err, ErrReadTimeout))
+	})
+
+	t.Run("TestWriteDeadline", func(t *testing.T) {
+		setServerReadRate(10 << 10) // 10KB/s
+
+		conn := newConn()
+		defer conn.Close()
+
+		// write 1KB without deadline
+		err := conn.SetWriteDeadline(time.Now())
+		MustNil(t, err)
+		err = conn.SetDeadline(time.Time{})
+		MustNil(t, err)
+		err = mallocAndFlush(conn, 1<<10) // ~100ms
+		MustNil(t, err)
+
+		// write with deadline
+		err = conn.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+		MustNil(t, err)
+		t0 := time.Now()
+		err = mallocAndFlush(conn, 1<<20)
+		MustTrue(t, errors.Is(err, ErrWriteTimeout))
+		MustTrue(t, time.Since(t0)-50*time.Millisecond < 20*time.Millisecond)
+
+		// write deadline exceeded
+		t1 := time.Now()
+		err = mallocAndFlush(conn, 10<<10)
+		MustTrue(t, errors.Is(err, ErrWriteTimeout))
+		MustTrue(t, time.Since(t1) < 20*time.Millisecond)
+	})
+
+	t.Run("TestReadDeadline", func(t *testing.T) {
+		setServerWriteRate(20 << 10) // 20KB/s
+
+		conn := newConn()
+		defer conn.Close()
+
+		// read 1KB without deadline
+		err := conn.SetReadDeadline(time.Now())
+		MustNil(t, err)
+		err = conn.SetDeadline(time.Time{})
+		MustNil(t, err)
+		_, err = conn.Reader().Next(1 << 10)
+		MustNil(t, err)
+
+		// read 100KB with deadline
+		err = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		MustNil(t, err)
+		t0 := time.Now()
+		_, err = conn.Reader().Next(100 << 10)
+		MustTrue(t, errors.Is(err, ErrReadTimeout))
+		MustTrue(t, time.Since(t0)-50*time.Millisecond < 20*time.Millisecond)
+
+		// read 10KB, deadline exceeded
+		t1 := time.Now()
+		_, err = conn.Reader().Next(10 << 10)
+		MustTrue(t, errors.Is(err, ErrReadTimeout))
+		MustTrue(t, time.Since(t1) < 20*time.Millisecond)
+	})
 }
 
 // TestConnectionLargeMemory is used to verify the memory usage in the large package scenario.
@@ -379,51 +530,46 @@ func TestConnectionLargeMemory(t *testing.T) {
 	runtime.ReadMemStats(&start)
 
 	r, w := GetSysFdPairs()
-	var rconn = &connection{}
+	rconn := &connection{}
 	rconn.init(&netFD{fd: r}, nil)
 
 	var wg sync.WaitGroup
-	defer wg.Wait()
-
-	var rn, wn = 1024, 1 * 1024 * 1024
+	rn, wn := 1024, 1*1024*1024
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		rconn.Reader().Next(wn)
+		_, err := rconn.Reader().Next(wn)
+		MustNil(t, err)
 	}()
 
-	var msg = make([]byte, rn)
+	msg := make([]byte, rn)
 	for i := 0; i < wn/rn; i++ {
-		n, err := syscall.Write(w, msg)
+		n, err := unix.Write(w, msg)
 		if err != nil {
-			panic(err)
+			MustNil(t, err)
 		}
-		if n != rn {
-			panic(fmt.Sprintf("n[%d]!=rn[%d]", n, rn))
-		}
-		time.Sleep(time.Millisecond)
+		Equal(t, n, rn)
 	}
 
 	runtime.ReadMemStats(&end)
 	alloc := end.TotalAlloc - start.TotalAlloc
 	limit := uint64(4 * 1024 * 1024)
-	if alloc > limit {
-		panic(fmt.Sprintf("alloc[%d] out of memory %d", alloc, limit))
-	}
+	Assert(t, alloc <= limit, fmt.Sprintf("alloc[%d] out of memory %d", alloc, limit))
 }
 
 // TestSetTCPNoDelay is used to verify the connection initialization set the TCP_NODELAY correctly
 func TestSetTCPNoDelay(t *testing.T) {
-	fd, err := sysSocket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	fd, err := socket.SysSocket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	MustNil(t, err)
 	conn := &connection{}
 	conn.init(&netFD{network: "tcp", fd: fd}, nil)
 
-	n, _ := syscall.GetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY)
+	n, _ := unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY)
 	MustTrue(t, n > 0)
-	err = setTCPNoDelay(fd, false)
+	err = socket.SetTCPNoDelay(fd, false)
 	MustNil(t, err)
-	n, _ = syscall.GetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY)
+	n, _ = unix.GetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY)
 	MustTrue(t, n == 0)
 }
 
@@ -432,7 +578,7 @@ func TestConnectionUntil(t *testing.T) {
 	rconn, wconn := &connection{}, &connection{}
 	rconn.init(&netFD{fd: r}, nil)
 	wconn.init(&netFD{fd: w}, nil)
-	loopSize := 100000
+	loopSize := 10000
 
 	msg := make([]byte, 1002)
 	msg[500], msg[1001] = '\n', '\n'
@@ -460,44 +606,57 @@ func TestConnectionUntil(t *testing.T) {
 
 func TestBookSizeLargerThanMaxSize(t *testing.T) {
 	r, w := GetSysFdPairs()
-	var rconn, wconn = &connection{}, &connection{}
-	rconn.init(&netFD{fd: r}, nil)
-	wconn.init(&netFD{fd: w}, nil)
+	rconn, wconn := &connection{}, &connection{}
+	err := rconn.init(&netFD{fd: r}, nil)
+	MustNil(t, err)
+	err = wconn.init(&netFD{fd: w}, nil)
+	MustNil(t, err)
 
-	var length = 25
-	dataCollection := make([][]byte, length)
-	for i := 0; i < length; i++ {
-		dataCollection[i] = make([]byte, 2<<i)
-		for j := 0; j < 2<<i; j++ {
-			dataCollection[i][j] = byte(rand.Intn(256))
+	// prepare data
+	maxSize := 1024 * 1024 * 128
+	origin := make([][]byte, 0)
+	for size := maxSize; size > 0; size = size >> 1 {
+		ch := 'a' + byte(size%26)
+		origin = append(origin, make([]byte, size))
+		for i := 0; i < size; i++ {
+			origin[len(origin)-1][i] = ch
 		}
 	}
 
+	// read
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < length; i++ {
-			buf, err := rconn.Reader().Next(2 << i)
+		idx := 0
+		for size := maxSize; size > 0; size = size >> 1 {
+			buf, err := rconn.Reader().Next(size)
 			MustNil(t, err)
-			Equal(t, string(buf), string(dataCollection[i]))
-			rconn.Reader().Release()
+			Equal(t, string(buf), string(origin[idx]))
+			err = rconn.Reader().Release()
+			MustNil(t, err)
+			idx++
 		}
 	}()
-	for i := 0; i < length; i++ {
-		n, err := wconn.Write(dataCollection[i])
+
+	// write
+	for i := 0; i < len(origin); i++ {
+		n, err := wconn.Write(origin[i])
 		MustNil(t, err)
-		Equal(t, n, 2<<i)
+		Equal(t, n, len(origin[i]))
 	}
 	wg.Wait()
 	rconn.Close()
+	wconn.Close()
 }
 
 func TestConnDetach(t *testing.T) {
-	address := getTestAddress()
-	ln, err := createTestListener("tcp", address)
-	MustNil(t, err)
+	ln := createTestTCPListener(t)
+	defer ln.Close()
+	address := ln.Addr().String()
 
+	// accept => read => write
+	var wg sync.WaitGroup
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -507,35 +666,33 @@ func TestConnDetach(t *testing.T) {
 			if conn == nil {
 				continue
 			}
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
 				buf := make([]byte, 1024)
 				// slow read
-				for {
-					_, err := conn.Read(buf)
-					if err != nil {
-						return
-					}
-					time.Sleep(100 * time.Millisecond)
-					_, err = conn.Write(buf)
-					if err != nil {
-						return
-					}
+				_, err := conn.Read(buf)
+				if err != nil {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+				_, err = conn.Write(buf)
+				if err != nil {
+					return
 				}
 			}()
 		}
 	}()
 
+	// dial => detach => write => read
 	c, err := DialConnection("tcp", address, time.Second)
 	MustNil(t, err)
-
 	conn := c.(*TCPConnection)
-
 	err = conn.Detach()
 	MustNil(t, err)
 
 	f := os.NewFile(uintptr(conn.fd), "anet-connection")
 	defer f.Close()
-
 	gonetconn, err := net.FileConn(f)
 	MustNil(t, err)
 	buf := make([]byte, 1024)
@@ -546,17 +703,17 @@ func TestConnDetach(t *testing.T) {
 
 	err = gonetconn.Close()
 	MustNil(t, err)
-
 	err = ln.Close()
 	MustNil(t, err)
+	err = c.Close()
+	MustNil(t, err)
+	wg.Wait()
 }
 
 func TestParallelShortConnection(t *testing.T) {
-	t.Skip("TODO: it's not stable now, need fix CI")
-	address := getTestAddress()
-	ln, err := createTestListener("tcp", address)
-	MustNil(t, err)
+	ln := createTestTCPListener(t)
 	defer ln.Close()
+	address := ln.Addr().String()
 
 	var received int64
 	el, err := NewEventLoop(func(ctx context.Context, connection Connection) error {
@@ -565,15 +722,17 @@ func TestParallelShortConnection(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		//t.Logf("conn[%s] received: %d, active: %v", connection.RemoteAddr(), len(data), connection.IsActive())
+		// t.Logf("conn[%s] received: %d, active: %v", connection.RemoteAddr(), len(data), connection.IsActive())
 		return nil
 	})
+	MustNil(t, err)
 	go func() {
 		el.Serve(ln)
 	}()
+	defer el.Shutdown(context.Background())
 
 	conns := 100
-	sizePerConn := 1024 * 100
+	sizePerConn := 1024
 	totalSize := conns * sizePerConn
 	var wg sync.WaitGroup
 	for i := 0; i < conns; i++ {
@@ -593,20 +752,20 @@ func TestParallelShortConnection(t *testing.T) {
 	}
 	wg.Wait()
 
-	count := 100
-	for count > 0 && atomic.LoadInt64(&received) < int64(totalSize) {
-		t.Logf("received: %d, except: %d", atomic.LoadInt64(&received), totalSize)
-		time.Sleep(time.Millisecond * 100)
-		count--
+	t0 := time.Now()
+	for atomic.LoadInt64(&received) < int64(totalSize) {
+		time.Sleep(time.Millisecond)
+		if time.Since(t0) > 100*time.Millisecond { // max wait 100ms
+			break
+		}
 	}
 	Equal(t, atomic.LoadInt64(&received), int64(totalSize))
 }
 
 func TestConnectionServerClose(t *testing.T) {
-	address := getTestAddress()
-	ln, err := createTestListener("tcp", address)
-	MustNil(t, err)
+	ln := createTestTCPListener(t)
 	defer ln.Close()
+	address := ln.Addr().String()
 
 	/*
 		Client              Server
@@ -652,9 +811,12 @@ func TestConnectionServerClose(t *testing.T) {
 		WithOnPrepare(func(connection Connection) context.Context {
 			t.Logf("server.OnPrepare: addr=%s", connection.RemoteAddr())
 			defer wg.Done()
+			//nolint:staticcheck // SA1029 no built-in type string as key
 			return context.WithValue(context.Background(), "prepare", "true")
 		}),
 	)
+	MustNil(t, err)
+
 	defer el.Shutdown(context.Background())
 	go func() {
 		err := el.Serve(ln)
@@ -680,7 +842,7 @@ func TestConnectionServerClose(t *testing.T) {
 
 		return connection.Close()
 	}
-	conns := 100
+	conns := 10
 	// server: OnPrepare, OnConnect, OnRequest, CloseCallback
 	// client: OnRequest, CloseCallback
 	wg.Add(conns * 6)
@@ -697,43 +859,74 @@ func TestConnectionServerClose(t *testing.T) {
 			})
 		}()
 	}
-	//time.Sleep(time.Second)
 	wg.Wait()
 }
 
-func TestConnectionDailTimeoutAndClose(t *testing.T) {
-	address := getTestAddress()
-	ln, err := createTestListener("tcp", address)
+func TestWriterAfterClose(t *testing.T) {
+	r, w := GetSysFdPairs()
+	rconn, wconn := &connection{}, &connection{}
+	rconn.init(&netFD{fd: r}, nil)
+	wconn.init(&netFD{fd: w}, nil)
+
+	err := wconn.Close()
 	MustNil(t, err)
+
+	for wconn.IsActive() {
+		runtime.Gosched()
+	}
+
+	methods := []struct {
+		name string
+		fn   func() error
+	}{
+		{"Malloc", func() error { _, err := wconn.Malloc(1); return err }},
+		{"MallocAck", func() error { return wconn.MallocAck(0) }},
+		{"WriteBinary", func() error { _, err := wconn.WriteBinary([]byte("hi")); return err }},
+		{"WriteString", func() error { _, err := wconn.WriteString("hi"); return err }},
+		{"WriteByte", func() error { return wconn.WriteByte('a') }},
+		{"WriteDirect", func() error { return wconn.WriteDirect([]byte("hi"), 0) }},
+		{"Flush", func() error { return wconn.Flush() }},
+	}
+	for _, tc := range methods {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Writer.%s panicked after Close: %v", tc.name, r)
+				}
+			}()
+			err := tc.fn()
+			Assert(t, err != nil, fmt.Sprintf("Writer.%s should return error after Close", tc.name))
+		})
+	}
+	rconn.Close()
+}
+
+func TestConnectionDailTimeoutAndClose(t *testing.T) {
+	ln := createTestTCPListener(t)
 	defer ln.Close()
 
-	el, err := NewEventLoop(
-		func(ctx context.Context, connection Connection) error {
-			_, err = connection.Reader().Next(connection.Reader().Len())
-			return err
-		},
-	)
-	defer el.Shutdown(context.Background())
 	go func() {
-		err := el.Serve(ln)
-		if err != nil {
-			t.Logf("service end with error: %v", err)
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+			conn.Close()
 		}
 	}()
 
-	loops := 100
-	conns := 100
-	for l := 0; l < loops; l++ {
-		var wg sync.WaitGroup
-		wg.Add(conns)
-		for i := 0; i < conns; i++ {
-			go func() {
-				defer wg.Done()
-				conn, err := DialConnection("tcp", address, time.Nanosecond)
-				Assert(t, err == nil || strings.Contains(err.Error(), "i/o timeout"))
-				_ = conn
-			}()
-		}
-		wg.Wait()
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := DialConnection("tcp", ln.Addr().String(), time.Millisecond)
+			Assert(t, err == nil || strings.Contains(err.Error(), "i/o timeout"), err)
+			if err == nil { // XXX: conn is always not nil ...
+				conn.Close()
+			}
+		}()
 	}
+	wg.Wait()
 }

@@ -34,7 +34,7 @@ func NewMuxServer() runner.Server {
 var _ runner.Server = &muxServer{}
 
 type muxServer struct {
-	*gnet.EventServer
+	gnet.BuiltinEventEngine
 	pool *goroutine.Pool
 }
 
@@ -43,29 +43,45 @@ func (s *muxServer) Run(network, address string) error {
 	defer p.Release()
 
 	echo := &muxServer{pool: p}
-	return gnet.Serve(echo, fmt.Sprintf("%s://%s", network, address), gnet.WithMulticore(true))
+	return gnet.Run(echo, fmt.Sprintf("%s://%s", network, address), gnet.WithMulticore(true))
 }
 
-func (s *muxServer) React(frame []byte, c gnet.Conn) (out []byte, action gnet.Action) {
+func (s *muxServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	mux := getOrNewMuxConn(c)
+	// Next returns a slice that is only valid until OnTraffic returns; Decode copies it.
+	frame, err := c.Next(-1)
+	if err != nil {
+		return gnet.Close
+	}
 	for {
 		req, err := mux.conner.Decode(frame)
 		if err != nil {
-			return nil, gnet.Close
+			return gnet.Close
 		}
 		if req == nil {
-			return nil, gnet.None
+			return gnet.None
 		}
-		frame = []byte{}
+		frame = nil
 
-		// Use ants pool to unblock the event-loop.
+		// Use the pool to unblock the event-loop.
 		s.pool.Submit(func() {
 			// handler
 			resp := runner.ProcessRequest(reporter, req)
 			// encode
-			mux.wch <- resp
+			select {
+			case mux.wch <- resp:
+			case <-mux.done:
+			}
 		})
 	}
+}
+
+func (s *muxServer) OnClose(c gnet.Conn, err error) (action gnet.Action) {
+	if v, ok := muxconnmap.LoadAndDelete(c); ok {
+		close(v.(*muxConn).done)
+	}
+	codec.RemoveConner(c)
+	return gnet.None
 }
 
 var muxconnmap sync.Map
@@ -80,6 +96,7 @@ func getOrNewMuxConn(conn gnet.Conn) *muxConn {
 	mux.conn = conn
 	mux.conner = codec.GetOrNewConner(conn)
 	mux.wch = make(chan *runner.Message)
+	mux.done = make(chan struct{})
 	go mux.loopWrite()
 	return mux
 }
@@ -88,16 +105,20 @@ type muxConn struct {
 	conn   gnet.Conn
 	conner *codec.Conner
 	wch    chan *runner.Message
+	done   chan struct{} // closed when the connection is closed
 }
 
 func (mux *muxConn) loopWrite() {
 	for {
-		msg := <-mux.wch
-		// encode
-		out := mux.conner.Encode(msg)
-		err := mux.conn.AsyncWrite(out)
-		if err != nil {
-			panic(fmt.Errorf("mux encode failed: %s", err.Error()))
+		select {
+		case msg := <-mux.wch:
+			// encode
+			out := mux.conner.Encode(msg)
+			if err := mux.conn.AsyncWrite(out, nil); err != nil {
+				return // connection already closed
+			}
+		case <-mux.done:
+			return
 		}
 	}
 }

@@ -13,78 +13,115 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build darwin || netbsd || freebsd || openbsd || dragonfly || linux
-// +build darwin netbsd freebsd openbsd dragonfly linux
-
 package anet
 
 import (
 	"context"
+	"io"
 	"net"
-	"runtime"
-	"sync"
+	"time"
+
+	"github.com/alolainc/anet/internal/logging"
+	"github.com/alolainc/anet/internal/runner"
 )
 
-// NewEventLoop .
+// This file is the public entry point of anet. It is the same on every platform: each function hands the
+// platform specific part to the backend (see backend.go).
+
+// Configure tunes the internal behavior of anet. Call it in an init function: the pollers read these
+// settings when they start. Fields left at their zero value keep the default.
+func Configure(config Config) (err error) {
+	if config.PollerNum > 0 {
+		if err = platform.setNumLoops(config.PollerNum); err != nil {
+			return err
+		}
+	}
+	if config.BufferSize > 0 {
+		defaultLinkBufferSize = config.BufferSize
+	}
+	if config.Runner != nil {
+		runner.RunTask = config.Runner
+	}
+	if config.LoggerOutput != nil {
+		logging.SetOutput(config.LoggerOutput)
+	}
+	if config.Logger != nil {
+		logging.SetLogger(config.Logger)
+	}
+	if config.LoadBalance >= 0 {
+		if err = platform.setLoadBalance(config.LoadBalance); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Initialize starts the pollers now instead of on first use. It is safe to call it more than once.
+func Initialize() { platform.initialize() }
+
+// SetNumLoops sets the number of pollers. By default it is runtime.GOMAXPROCS(0)/20+1, which suits the
+// goroutine request mode; the default inline mode raises it to GOMAXPROCS (see WithInlineRequest).
+// Call it before any connection is created, for example in an init function.
+//
+// Deprecated: use Configure instead.
+func SetNumLoops(numLoops int) error { return platform.setNumLoops(numLoops) }
+
+// SetLoadBalance sets how connections are spread over the pollers. It only matters with more than one poller.
+//
+// Deprecated: use Configure instead.
+func SetLoadBalance(lb LoadBalance) error { return platform.setLoadBalance(lb) }
+
+// SetLoggerOutput sets where anet writes its text log. To get structured records instead, set Config.Logger.
+//
+// Deprecated: use Configure instead.
+func SetLoggerOutput(w io.Writer) { logging.SetOutput(w) }
+
+// SetRunner sets the function that runs OnRequest and OnConnect in the goroutine request mode.
+//
+// Deprecated: use Configure and set Config.Runner instead.
+func SetRunner(f func(ctx context.Context, f func())) { runner.RunTask = f }
+
+// DisableGopool runs OnRequest with a plain `go` statement instead of the goroutine pool. Reusing
+// goroutines avoids stack growth when handlers use a lot of stack; without that, plain goroutines are cheaper.
+//
+// Deprecated: use Configure and set Config.Runner instead.
+func DisableGopool() error {
+	runner.UseGoRunTask()
+	return nil
+}
+
+// NewEventLoop creates a server that calls onRequest when a connection has data to read.
+// See the options (With...) for the other callbacks and for how handlers run.
 func NewEventLoop(onRequest OnRequest, ops ...Option) (EventLoop, error) {
 	opts := &options{
-		onRequest: onRequest,
+		onRequest:  onRequest,
+		inline:     true, // default; WithGoroutineRequest opts out
+		inlineAuto: true,
 	}
 	for _, do := range ops {
 		do.f(opts)
 	}
-	return &eventLoop{
-		opts: opts,
-		stop: make(chan error, 1),
-	}, nil
+	return platform.newEventLoop(opts), nil
 }
 
-type eventLoop struct {
-	sync.Mutex
-	opts *options
-	svr  *server
-	stop chan error
+// NewDialer returns a Dialer for TCP and unix sockets.
+func NewDialer() Dialer { return platform.dialer() }
+
+// DialConnection dials address and returns a Connection.
+func DialConnection(network, address string, timeout time.Duration) (connection Connection, err error) {
+	return platform.dialer().DialConnection(network, address, timeout)
 }
 
-// Serve implements EventLoop.
-func (evl *eventLoop) Serve(ln net.Listener) error {
-	npln, err := ConvertListener(ln)
-	if err != nil {
-		return err
-	}
-	evl.Lock()
-	evl.svr = newServer(npln, evl.opts, evl.quit)
-	evl.svr.Run()
-	evl.Unlock()
-
-	err = evl.waitQuit()
-	// ensure evl will not be finalized until Serve returns
-	runtime.SetFinalizer(evl, nil)
-	return err
+// CreateListener listens on addr (TCP or unix socket; UDP is not supported).
+func CreateListener(network, addr string) (l Listener, err error) {
+	return platform.createListener(network, addr)
 }
 
-// Shutdown signals a shutdown a begins server closing.
-func (evl *eventLoop) Shutdown(ctx context.Context) error {
-	evl.Lock()
-	var svr = evl.svr
-	evl.svr = nil
-	evl.Unlock()
-
-	if svr == nil {
-		return nil
-	}
-	evl.quit(nil)
-	return svr.Close(ctx)
+// CreateReusePortListener listens on a TCP address for an EventLoop created WithReusePort: with SO_REUSEPORT
+// where the kernel balances such sockets (Linux, FreeBSD), as a plain listener elsewhere.
+func CreateReusePortListener(network, addr string) (Listener, error) {
+	return platform.createReusePortListener(network, addr)
 }
 
-// waitQuit waits for a quit signal
-func (evl *eventLoop) waitQuit() error {
-	return <-evl.stop
-}
-
-func (evl *eventLoop) quit(err error) {
-	select {
-	case evl.stop <- err:
-	default:
-	}
-}
+// ConvertListener wraps a net.Listener so that an EventLoop can serve it.
+func ConvertListener(l net.Listener) (nl Listener, err error) { return platform.convertListener(l) }

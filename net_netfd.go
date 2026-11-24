@@ -1,17 +1,4 @@
 // Copyright 2024 Alola Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -20,7 +7,6 @@
 // All CloudWeGo Modifications are Copyright 2022 CloudWeGo authors.
 
 //go:build aix || darwin || dragonfly || freebsd || linux || nacl || netbsd || openbsd || solaris
-// +build aix darwin dragonfly freebsd linux nacl netbsd openbsd solaris
 
 package anet
 
@@ -30,18 +16,14 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-var (
-	// aLongTimeAgo is a non-zero time, far in the past, used for
-	// immediate cancelation of dials.
-	aLongTimeAgo = time.Unix(1, 0)
-	// nonDeadline and noCancel are just zero values for
-	// readability with functions taking too many parameters.
-	noDeadline = time.Time{}
-)
+// nonDeadline and noCancel are just zero values for
+// readability with functions taking too many parameters.
+var noDeadline = time.Time{}
 
 type netFD struct {
 	// file descriptor
@@ -52,16 +34,15 @@ type netFD struct {
 	pd *pollDesc
 	// closed marks whether fd has expired
 	closed uint32
-	// Whether this is a streaming descriptor, as opposed to a
-	// packet-based descriptor like a UDP socket. Immutable.
+	// Whether this is a streaming descriptor. Immutable.
 	isStream bool
 	// Whether a zero byte read indicates EOF. This is false for a
 	// message based socket connection.
 	zeroReadIsEOF bool
-	family        int    // AF_INET, AF_INET6, syscall.AF_UNIX
-	sotype        int    // syscall.SOCK_STREAM, syscall.SOCK_DGRAM, syscall.SOCK_RAW
+	family        int    // AF_INET, AF_INET6, unix.AF_UNIX
+	sotype        int    // unix.SOCK_STREAM, unix.SOCK_DGRAM, unix.SOCK_RAW
 	isConnected   bool   // handshake completed or use of association with peer
-	network       string // tcp tcp4 tcp6, udp, udp4, udp6, ip, ip4, ip6, unix, unixgram, unixpacket
+	network       string // tcp, tcp4, tcp6, unix, unixgram, unixpacket
 	localAddr     net.Addr
 	remoteAddr    net.Addr
 	// for detaching conn from poller
@@ -69,31 +50,31 @@ type netFD struct {
 }
 
 func newNetFD(fd, family, sotype int, net string) *netFD {
-	var ret = &netFD{}
+	ret := &netFD{}
 	ret.fd = fd
 	ret.network = net
 	ret.family = family
 	ret.sotype = sotype
-	ret.isStream = sotype == syscall.SOCK_STREAM
-	ret.zeroReadIsEOF = sotype != syscall.SOCK_DGRAM && sotype != syscall.SOCK_RAW
+	ret.isStream = sotype == unix.SOCK_STREAM
+	ret.zeroReadIsEOF = sotype != unix.SOCK_DGRAM && sotype != unix.SOCK_RAW
 	return ret
 }
 
 // if dial connection error, you need exec netFD.Close actively
 func (c *netFD) dial(ctx context.Context, laddr, raddr sockaddr) (err error) {
-	var lsa syscall.Sockaddr
+	var lsa unix.Sockaddr
 	if laddr != nil {
 		if lsa, err = laddr.sockaddr(c.family); err != nil {
 			return err
 		} else if lsa != nil {
 			// bind local address
-			if err = syscall.Bind(c.fd, lsa); err != nil {
+			if err = unix.Bind(c.fd, lsa); err != nil {
 				return os.NewSyscallError("bind", err)
 			}
 		}
 	}
-	var rsa syscall.Sockaddr  // remote address from the user
-	var crsa syscall.Sockaddr // remote address we actually connected to
+	var rsa unix.Sockaddr  // remote address from the user
+	var crsa unix.Sockaddr // remote address we actually connected to
 	if raddr != nil {
 		if rsa, err = raddr.sockaddr(c.family); err != nil {
 			return err
@@ -111,11 +92,11 @@ func (c *netFD) dial(ctx context.Context, laddr, raddr sockaddr) (err error) {
 	// 1) the one returned by the connect method, if any; or
 	// 2) the one from Getpeername, if it succeeds; or
 	// 3) the one passed to us as the raddr parameter.
-	lsa, _ = syscall.Getsockname(c.fd)
+	lsa, _ = unix.Getsockname(c.fd)
 	c.localAddr = sockaddrToAddr(lsa)
 	if crsa != nil {
 		c.remoteAddr = sockaddrToAddr(crsa)
-	} else if crsa, _ = syscall.Getpeername(c.fd); crsa != nil {
+	} else if crsa, _ = unix.Getpeername(c.fd); crsa != nil {
 		c.remoteAddr = sockaddrToAddr(crsa)
 	} else {
 		c.remoteAddr = sockaddrToAddr(rsa)
@@ -123,20 +104,20 @@ func (c *netFD) dial(ctx context.Context, laddr, raddr sockaddr) (err error) {
 	return nil
 }
 
-func (c *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa syscall.Sockaddr, retErr error) {
+func (c *netFD) connect(ctx context.Context, la, ra unix.Sockaddr) (rsa unix.Sockaddr, retErr error) {
 	// Do not need to call c.writing here,
 	// because c is not yet accessible to user,
 	// so no concurrent operations are possible.
-	switch err := syscall.Connect(c.fd, ra); err {
-	case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:
-	case nil, syscall.EISCONN:
+	switch err := unix.Connect(c.fd, ra); err {
+	case unix.EINPROGRESS, unix.EALREADY, unix.EINTR:
+	case nil, unix.EISCONN:
 		select {
 		case <-ctx.Done():
 			return nil, mapErr(ctx.Err())
 		default:
 		}
 		return nil, nil
-	case syscall.EINVAL:
+	case unix.EINVAL:
 		// On Solaris we can see EINVAL if the socket has
 		// already been accepted and closed by the server.
 		// Treat this as a successful connection--writes to
@@ -151,6 +132,11 @@ func (c *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysca
 	}
 
 	c.pd = newPollDesc(c.fd)
+	defer func() {
+		// free operator to avoid leak
+		c.pd.operator.Free()
+		c.pd = nil
+	}()
 	for {
 		// Performing multiple connect system calls on a
 		// non-blocking socket under Unix variants does not
@@ -163,19 +149,19 @@ func (c *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysca
 		if err := c.pd.WaitWrite(ctx); err != nil {
 			return nil, err
 		}
-		nerr, err := syscall.GetsockoptInt(c.fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
+		nerr, err := unix.GetsockoptInt(c.fd, unix.SOL_SOCKET, unix.SO_ERROR)
 		if err != nil {
 			return nil, os.NewSyscallError("getsockopt", err)
 		}
-		switch err := syscall.Errno(nerr); err {
-		case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:
-		case syscall.EISCONN:
+		switch err := unix.Errno(nerr); err {
+		case unix.EINPROGRESS, unix.EALREADY, unix.EINTR:
+		case unix.EISCONN:
 			return nil, nil
-		case syscall.Errno(0):
+		case unix.Errno(0):
 			// The runtime poller can wake us up spuriously;
 			// see issues 14548 and 19289. Check that we are
 			// really connected; if not, wait again.
-			if rsa, err := syscall.Getpeername(c.fd); err == nil {
+			if rsa, err := unix.Getpeername(c.fd); err == nil {
 				return rsa, nil
 			}
 		default:

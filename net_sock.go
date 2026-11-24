@@ -1,17 +1,4 @@
 // Copyright 2024 Alola Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -20,7 +7,6 @@
 // All CloudWeGo Modifications are Copyright 2022 CloudWeGo authors.
 
 //go:build !windows
-// +build !windows
 
 package anet
 
@@ -28,11 +14,14 @@ import (
 	"context"
 	"net"
 	"runtime"
-	"syscall"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/alolainc/anet/internal/socket"
 )
 
-// A sockaddr represents a TCP, UDP, IP or Unix network endpoint
-// address that can be converted into a syscall.Sockaddr.
+// A sockaddr represents a TCP, IP or Unix network endpoint
+// address that can be converted into a unix.Sockaddr.
 type sockaddr interface {
 	net.Addr
 
@@ -45,20 +34,20 @@ type sockaddr interface {
 	isWildcard() bool
 
 	// sockaddr returns the address converted into a syscall
-	// sockaddr type that implements syscall.Sockaddr
+	// sockaddr type that implements unix.Sockaddr
 	// interface. It returns a nil interface when the address is nil.
-	sockaddr(family int) (syscall.Sockaddr, error)
+	sockaddr(family int) (unix.Sockaddr, error)
 
 	// toLocal maps the zero address to a local system address (127.0.0.1 or ::1)
 	toLocal(net string) sockaddr
 }
 
 func internetSocket(ctx context.Context, net string, laddr, raddr sockaddr, sotype, proto int, mode string) (conn *netFD, err error) {
-	if (runtime.GOOS == "aix" || runtime.GOOS == "windows" || runtime.GOOS == "openbsd" || runtime.GOOS == "nacl") && raddr.isWildcard() {
+	if (runtime.GOOS == "aix" || runtime.GOOS == "openbsd" || runtime.GOOS == "nacl") && raddr.isWildcard() {
 		raddr = raddr.toLocal(net)
 	}
 	family, ipv6only := favoriteAddrFamily(net, laddr, raddr)
-	return socket(ctx, net, family, sotype, proto, ipv6only, laddr, raddr)
+	return newSocketFD(ctx, net, family, sotype, proto, ipv6only, laddr, raddr)
 }
 
 // favoriteAddrFamily returns the appropriate address family for the
@@ -69,29 +58,29 @@ func internetSocket(ctx context.Context, net string, laddr, raddr sockaddr, soty
 // address family, both AF_INET and AF_INET6, and a wildcard address
 // like the following:
 //
-// 	- A listen for a wildcard communication domain, "tcp" or
-// 	  "udp", with a wildcard address: If the platform supports
-// 	  both IPv6 and IPv4-mapped IPv6 communication capabilities,
-// 	  or does not support IPv4, we use a dual stack, AF_INET6 and
-// 	  IPV6_V6ONLY=0, wildcard address listen. The dual stack
-// 	  wildcard address listen may fall back to an IPv6-only,
-// 	  AF_INET6 and IPV6_V6ONLY=1, wildcard address listen.
-// 	  Otherwise we prefer an IPv4-only, AF_INET, wildcard address
-// 	  listen.
+//   - A listen for a wildcard communication domain, "tcp",
+//     with a wildcard address: If the platform supports
+//     both IPv6 and IPv4-mapped IPv6 communication capabilities,
+//     or does not support IPv4, we use a dual stack, AF_INET6 and
+//     IPV6_V6ONLY=0, wildcard address listen. The dual stack
+//     wildcard address listen may fall back to an IPv6-only,
+//     AF_INET6 and IPV6_V6ONLY=1, wildcard address listen.
+//     Otherwise we prefer an IPv4-only, AF_INET, wildcard address
+//     listen.
 //
-// 	- A listen for a wildcard communication domain, "tcp" or
-// 	  "udp", with an IPv4 wildcard address: same as above.
+//   - A listen for a wildcard communication domain, "tcp",
+//     with an IPv4 wildcard address: same as above.
 //
-// 	- A listen for a wildcard communication domain, "tcp" or
-// 	  "udp", with an IPv6 wildcard address: same as above.
+//   - A listen for a wildcard communication domain, "tcp",
+//     with an IPv6 wildcard address: same as above.
 //
-// 	- A listen for an IPv4 communication domain, "tcp4" or "udp4",
-// 	  with an IPv4 wildcard address: We use an IPv4-only, AF_INET,
-// 	  wildcard address listen.
+//   - A listen for an IPv4 communication domain, "tcp4",
+//     with an IPv4 wildcard address: We use an IPv4-only, AF_INET,
+//     wildcard address listen.
 //
-// 	- A listen for an IPv6 communication domain, "tcp6" or "udp6",
-// 	  with an IPv6 wildcard address: We use an IPv6-only, AF_INET6
-// 	  and IPV6_V6ONLY=1, wildcard address listen.
+//   - A listen for an IPv6 communication domain, "tcp6",
+//     with an IPv6 wildcard address: We use an IPv6-only, AF_INET6
+//     and IPV6_V6ONLY=1, wildcard address listen.
 //
 // Otherwise guess: If the addresses are IPv4 then returns AF_INET,
 // or else returns AF_INET6. It also returns a boolean value what
@@ -103,29 +92,29 @@ func internetSocket(ctx context.Context, net string, laddr, raddr sockaddr, soty
 func favoriteAddrFamily(network string, laddr, raddr sockaddr) (family int, ipv6only bool) {
 	switch network[len(network)-1] {
 	case '4':
-		return syscall.AF_INET, false
+		return unix.AF_INET, false
 	case '6':
-		return syscall.AF_INET6, true
+		return unix.AF_INET6, true
 	}
-	if (laddr == nil || laddr.family() == syscall.AF_INET) &&
-		(raddr == nil || raddr.family() == syscall.AF_INET) {
-		return syscall.AF_INET, false
+	if (laddr == nil || laddr.family() == unix.AF_INET) &&
+		(raddr == nil || raddr.family() == unix.AF_INET) {
+		return unix.AF_INET, false
 	}
-	return syscall.AF_INET6, false
+	return unix.AF_INET6, false
 }
 
-// socket returns a network file descriptor that is ready for
+// newSocketFD returns a network file descriptor that is ready for
 // asynchronous I/O using the network poller.
-func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr) (netfd *netFD, err error) {
-	// syscall.Socket & set socket options
+func newSocketFD(ctx context.Context, net string, family, sotype, proto int, ipv6only bool, laddr, raddr sockaddr) (netfd *netFD, err error) {
+	// unix.Socket & set socket options
 	var fd int
-	fd, err = sysSocket(family, sotype, proto)
+	fd, err = socket.SysSocket(family, sotype, proto)
 	if err != nil {
 		return nil, err
 	}
-	err = setDefaultSockopts(fd, family, sotype, ipv6only)
+	err = socket.SetDefaultSockopts(fd, family, sotype, ipv6only)
 	if err != nil {
-		syscall.Close(fd)
+		unix.Close(fd)
 		return nil, err
 	}
 
@@ -139,15 +128,15 @@ func socket(ctx context.Context, net string, family, sotype, proto int, ipv6only
 }
 
 // sockaddrToAddr returns a go/net friendly address
-func sockaddrToAddr(sa syscall.Sockaddr) net.Addr {
+func sockaddrToAddr(sa unix.Sockaddr) net.Addr {
 	var a net.Addr
 	switch sa := sa.(type) {
-	case *syscall.SockaddrInet4:
+	case *unix.SockaddrInet4:
 		a = &net.TCPAddr{
 			IP:   sa.Addr[0:],
 			Port: sa.Port,
 		}
-	case *syscall.SockaddrInet6:
+	case *unix.SockaddrInet6:
 		var zone string
 		if sa.ZoneId != 0 {
 			if ifi, err := net.InterfaceByIndex(int(sa.ZoneId)); err == nil {
@@ -161,7 +150,7 @@ func sockaddrToAddr(sa syscall.Sockaddr) net.Addr {
 			Port: sa.Port,
 			Zone: zone,
 		}
-	case *syscall.SockaddrUnix:
+	case *unix.SockaddrUnix:
 		a = &net.UnixAddr{Net: "unix", Name: sa.Name}
 	}
 	return a

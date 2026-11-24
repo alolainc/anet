@@ -23,7 +23,7 @@ import (
 	"time"
 
 	"github.com/alolainc/anet"
-	"github.com/alolainc/anet/pkg/mux"
+	"github.com/alolainc/anet/mux"
 
 	"github.com/alolainc/anet/examples/echo/codec"
 )

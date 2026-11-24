@@ -1,8 +1,56 @@
-AlolaInc
+anet
 Copyright 2024 Alola Inc.
 
-CloudWeGO
-Copyright 2022 CloudWeGO authors.
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
-Go
-Copyright (c) 2009 The Go Authors.
+It is derived from CloudWeGo netpoll v0.7.5
+  https://github.com/cloudwego/netpoll
+  Copyright 2022-2024 CloudWeGo Authors, licensed under the Apache License, Version 2.0.
+
+Changes made by Alola Inc. to the upstream source:
+  - Module path and package renamed to github.com/alolainc/anet.
+  - Layout: the poller (upstream poll_*.go, fd_operator*.go, sys_epoll_*.go) moved to internal/netpoll, the
+    socket system calls (upstream sys_*.go, net_io.go) to internal/socket, the error values to internal/errs and
+    the logger to internal/logging. Package anet re-exports the public names, so its API is unchanged.
+    Upstream anet_unix.go and anet_windows.go were merged into anet.go, which delegates to a platform backend
+    (backend*.go).
+  - internal/runner uses github.com/alolainc/gopool to run connection callbacks.
+  - Log prefix changed to "[anet]:".
+  - internal/netpoll/poller.go (upstream poll_default.go): readall no longer spins on EAGAIN/EINTR.
+  - internal/netpoll/poller_bsd.go (upstream poll_default_bsd.go): fixed the value reported in the readall
+    error log; the wake-up event moved to waker_kqueue.go, and waker_pipe.go (new) wakes the poller with a
+    self-pipe on OpenBSD, NetBSD and DragonFly, which upstream did not build on.
+  - internal/socket/sendmsg_bsd.go: Msghdr.Iovlen is set per platform (iovlen_*.go), as it is a uint32 on
+    OpenBSD.
+  - connection_impl.go: the input buffer is no longer allocated in connection init; it is allocated
+    on the first read, so idle connections do not hold a buffer each.
+  - Added WithInlineRequest and WithGoroutineRequest: OnRequest runs on the poller goroutine by default (not
+    when OnConnect is set); WithGoroutineRequest restores a goroutine per request. Inline mode raises the
+    poller count to GOMAXPROCS when the user did not choose it (internal/netpoll/manager.go). Touches
+    connection_impl.go, connection_onevent.go, connection_reactor.go, options.go and errors.go (new
+    ErrNotEnoughData).
+  - Added SocketTuner (SO_SNDBUF, SO_RCVBUF, TCP_NOTSENT_LOWAT) with WithSendBuffer, WithRecvBuffer and
+    WithNotSentLowat.
+  - Added package tee (fan-out of frames to many connections) and PendingWrite on the connection types.
+  - System calls use golang.org/x/sys/unix instead of package syscall (Linux 32-bit now builds).
+  - nocopy_linkbuffer.go: dropIfDrained gives a drained buffer's memory back to the pool; connections call it
+    after an inline OnRequest (input) and after a complete Flush (output), so idle connections hold no buffers.
+    The flush barrier is taken from the pool per call.
+  - connection_impl.go, connection_reactor.go: the output buffer has one owner at a time (writer or poller),
+    which fixes concurrent Flush calls racing with the poller in inline mode.
+  - Added PacketLoop (packet*.go, internal/socket/recvfrom.go): UDP served by the pollers.
+  - Added WithReusePort and CreateReusePortListener (SO_REUSEPORT on Linux, SO_REUSEPORT_LB on FreeBSD, a
+    listener shared by the pollers elsewhere). server.Close is split so a shared listener is closed once.
+  - internal/socket: sockets and accepted connections are close-on-exec and non-blocking atomically
+    (SOCK_CLOEXEC, accept4) where the kernel supports it, else under syscall.ForkLock; upstream left accepted
+    descriptors inheritable by exec'd children.
+  - Added Config.Logger (*slog.Logger).
+  - portable_conn.go, portable_server.go, backend_portable.go (new, Alola Inc.): a net.Conn based backend
+    used on Windows, where anet has no native poller.
+  Files modified by Alola Inc. carry an additional "Copyright Alola Inc." line; files written by
+  Alola Inc. carry only that line.
+
+Portions of this product (net_netfd.go, net_sock.go, net_tcpsock.go, net_unixsock.go,
+internal/socket/sockopt_bsd.go, internal/socket/sockopt_linux.go) are derived from the Go standard library,
+Copyright 2009 The Go Authors, licensed under the BSD 3-Clause license
+(see THIRD-PARTY-LICENSE).

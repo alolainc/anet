@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"os"
 
 	"github.com/alolainc/anet"
 
@@ -41,7 +43,11 @@ func (s *rpcServer) Run(network, address string) error {
 	}
 
 	// new server
-	eventLoop, err := anet.NewEventLoop(s.handler)
+	var opts []anet.Option
+	if os.Getenv("ANET_INLINE") == "0" { // inline is anet's default; 0 selects the goroutine-per-request mode
+		opts = append(opts, anet.WithGoroutineRequest())
+	}
+	eventLoop, err := anet.NewEventLoop(s.handler, opts...)
 	if err != nil {
 		panic(err)
 	}
@@ -56,6 +62,9 @@ func (s *rpcServer) handler(ctx context.Context, conn anet.Connection) (err erro
 	req := &runner.Message{}
 	err = codec.Decode(reader, req)
 	if err != nil {
+		if errors.Is(err, anet.ErrNotEnoughData) {
+			return nil // inline mode: wait for the rest of the frame
+		}
 		return err
 	}
 

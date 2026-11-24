@@ -14,7 +14,6 @@
 // limitations under the License.
 
 //go:build !windows
-// +build !windows
 
 package anet
 
@@ -38,9 +37,9 @@ func (c *connection) onHup(p Poll) error {
 	// It depends on closing by user if OnConnect and OnRequest is nil, otherwise it needs to be released actively.
 	// It can be confirmed that the OnRequest goroutine has been exited before closeCallback executing,
 	// and it is safe to close the buffer at this time.
-	var onConnect = c.onConnectCallback.Load()
-	var onRequest = c.onRequestCallback.Load()
-	var needCloseByUser = onConnect == nil && onRequest == nil
+	onConnect := c.onConnectCallback.Load()
+	onRequest := c.onRequestCallback.Load()
+	needCloseByUser := onConnect == nil && onRequest == nil
 	if !needCloseByUser {
 		// already PollDetach when call OnHup
 		c.closeCallback(true, false)
@@ -70,8 +69,8 @@ func (c *connection) onClose() error {
 
 // closeBuffer recycle input & output LinkBuffer.
 func (c *connection) closeBuffer() {
-	var onConnect, _ = c.onConnectCallback.Load().(OnConnect)
-	var onRequest, _ = c.onRequestCallback.Load().(OnRequest)
+	onConnect, _ := c.onConnectCallback.Load().(OnConnect)
+	onRequest, _ := c.onRequestCallback.Load().(OnRequest)
 	// if client close the connection, we cannot ensure that the poller is not process the buffer,
 	// so we need to check the buffer length, and if it's an "unclean" close operation, let's give up to reuse the buffer
 	if c.inputBuffer.Len() == 0 || onConnect != nil || onRequest != nil {
@@ -79,7 +78,6 @@ func (c *connection) closeBuffer() {
 	}
 	if c.outputBuffer.Len() == 0 || onConnect != nil || onRequest != nil {
 		c.outputBuffer.Close()
-		barrierPool.Put(c.outputBarrier)
 	}
 }
 
@@ -109,8 +107,10 @@ func (c *connection) inputAck(n int) (err error) {
 		c.maxSize = mallocMax
 	}
 
-	var needTrigger = true
-	if length == n { // first start onRequest
+	needTrigger := true
+	// first start onRequest. In inline mode OnRequest may return while unread data remains (it is waiting
+	// for more), so it must also be called whenever new data arrives.
+	if length == n || c.inline {
 		needTrigger = c.onRequest()
 	}
 	if needTrigger && length >= int(atomic.LoadInt64(&c.waitReadSize)) {
@@ -120,13 +120,13 @@ func (c *connection) inputAck(n int) (err error) {
 }
 
 // outputs implements FDOperator.
-func (c *connection) outputs(vs [][]byte) (rs [][]byte, supportZeroCopy bool) {
+func (c *connection) outputs(vs [][]byte) (rs [][]byte, _ bool) {
 	if c.outputBuffer.IsEmpty() {
-		c.rw2r()
-		return rs, c.supportZeroCopy
+		c.outputDrained()
+		return rs, false
 	}
 	rs = c.outputBuffer.GetBytes(vs)
-	return rs, c.supportZeroCopy
+	return rs, false
 }
 
 // outputAck implements FDOperator.
@@ -136,13 +136,27 @@ func (c *connection) outputAck(n int) (err error) {
 		c.outputBuffer.Release()
 	}
 	if c.outputBuffer.IsEmpty() {
-		c.rw2r()
+		c.outputDrained()
 	}
 	return nil
 }
 
-// rw2r removed the monitoring of write events.
-func (c *connection) rw2r() {
-	c.operator.Control(PollRW2R)
+// Owners of the output buffer, see connection.outOwner.
+const (
+	outIdle int32 = iota
+	outWriter
+	outPoller
+)
+
+// outputDrained runs on the poller when it has sent everything it owned.
+func (c *connection) outputDrained() {
+	c.operator.Control(PollRW2R) // stop waiting for writability while we still own the buffer
+	c.outOwner.Store(outIdle)
+	// A writer may have published more data after our check and returned because we owned the buffer.
+	// Take it back if no writer did, so that data is sent.
+	if !c.outputBuffer.IsEmpty() && c.outOwner.CompareAndSwap(outIdle, outPoller) {
+		c.operator.Control(PollR2RW)
+		return
+	}
 	c.triggerWrite(nil)
 }

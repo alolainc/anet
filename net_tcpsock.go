@@ -1,17 +1,4 @@
 // Copyright 2024 Alola Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -20,7 +7,6 @@
 // All CloudWeGo Modifications are Copyright 2022 CloudWeGo authors.
 
 //go:build !windows
-// +build !windows
 
 package anet
 
@@ -28,7 +14,8 @@ import (
 	"context"
 	"net"
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // TCPAddr represents the address of a TCP end point.
@@ -52,15 +39,15 @@ func (a *TCPAddr) opAddr() net.Addr {
 
 func (a *TCPAddr) family() int {
 	if a == nil || len(a.IP) <= net.IPv4len {
-		return syscall.AF_INET
+		return unix.AF_INET
 	}
 	if a.IP.To4() != nil {
-		return syscall.AF_INET
+		return unix.AF_INET
 	}
-	return syscall.AF_INET6
+	return unix.AF_INET6
 }
 
-func (a *TCPAddr) sockaddr(family int) (syscall.Sockaddr, error) {
+func (a *TCPAddr) sockaddr(family int) (unix.Sockaddr, error) {
 	if a == nil {
 		return nil, nil
 	}
@@ -82,9 +69,9 @@ func loopbackIP(network string) net.IP {
 	return net.IP{127, 0, 0, 1}
 }
 
-func ipToSockaddr(family int, ip net.IP, port int, zone string) (syscall.Sockaddr, error) {
+func ipToSockaddr(family int, ip net.IP, port int, zone string) (unix.Sockaddr, error) {
 	switch family {
-	case syscall.AF_INET:
+	case unix.AF_INET:
 		if len(ip) == 0 {
 			ip = net.IPv4zero
 		}
@@ -92,10 +79,10 @@ func ipToSockaddr(family int, ip net.IP, port int, zone string) (syscall.Sockadd
 		if ip4 == nil {
 			return nil, &net.AddrError{Err: "non-IPv4 address", Addr: ip.String()}
 		}
-		sa := &syscall.SockaddrInet4{Port: port}
+		sa := &unix.SockaddrInet4{Port: port}
 		copy(sa.Addr[:], ip4)
 		return sa, nil
-	case syscall.AF_INET6:
+	case unix.AF_INET6:
 		// In general, an IP wildcard address, which is either
 		// "0.0.0.0" or "::", means the entire IP addressing
 		// space. For some historical reason, it is used to
@@ -115,8 +102,8 @@ func ipToSockaddr(family int, ip net.IP, port int, zone string) (syscall.Sockadd
 		if ip6 == nil {
 			return nil, &net.AddrError{Err: "non-IPv6 address", Addr: ip.String()}
 		}
-		// TODO: sa := &syscall.SockaddrInet6{Port: port, ZoneId: uint32(zoneCache.index(zone))}
-		sa := &syscall.SockaddrInet6{Port: port}
+		// TODO: sa := &unix.SockaddrInet6{Port: port, ZoneId: uint32(zoneCache.index(zone))}
+		sa := &unix.SockaddrInet6{Port: port}
 		copy(sa.Addr[:], ip6)
 		return sa, nil
 	}
@@ -189,7 +176,7 @@ func DialTCP(ctx context.Context, network string, laddr, raddr *TCPAddr) (*TCPCo
 }
 
 func (sd *sysDialer) dialTCP(ctx context.Context, laddr, raddr *TCPAddr) (*TCPConnection, error) {
-	conn, err := internetSocket(ctx, sd.network, laddr, raddr, syscall.SOCK_STREAM, 0, "dial")
+	conn, err := internetSocket(ctx, sd.network, laddr, raddr, unix.SOCK_STREAM, 0, "dial")
 
 	// TCP has a rarely used mechanism called a 'simultaneous connection' in
 	// which Dial("tcp", addr1, addr2) run on the machine at addr1 can
@@ -219,7 +206,7 @@ func (sd *sysDialer) dialTCP(ctx context.Context, laddr, raddr *TCPAddr) (*TCPCo
 		if err == nil {
 			conn.Close()
 		}
-		conn, err = internetSocket(ctx, sd.network, laddr, raddr, syscall.SOCK_STREAM, 0, "dial")
+		conn, err = internetSocket(ctx, sd.network, laddr, raddr, unix.SOCK_STREAM, 0, "dial")
 	}
 
 	if err != nil {
@@ -257,5 +244,5 @@ func spuriousENOTAVAIL(err error) bool {
 	if sys, ok := err.(*os.SyscallError); ok {
 		err = sys.Err
 	}
-	return err == syscall.EADDRNOTAVAIL
+	return err == unix.EADDRNOTAVAIL
 }

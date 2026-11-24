@@ -33,7 +33,7 @@ func NewRPCServer() runner.Server {
 var _ runner.Server = &rpcServer{}
 
 type rpcServer struct {
-	*gnet.EventServer
+	gnet.BuiltinEventEngine
 	pool *goroutine.Pool
 }
 
@@ -42,30 +42,39 @@ func (s *rpcServer) Run(network, address string) error {
 	defer p.Release()
 
 	echo := &rpcServer{pool: p}
-	return gnet.Serve(echo, fmt.Sprintf("%s://%s", network, address), gnet.WithMulticore(true))
+	return gnet.Run(echo, fmt.Sprintf("%s://%s", network, address), gnet.WithMulticore(true))
 }
 
-func (s *rpcServer) React(frame []byte, c gnet.Conn) (out []byte, action gnet.Action) {
+func (s *rpcServer) OnTraffic(c gnet.Conn) (action gnet.Action) {
 	conner := codec.GetOrNewConner(c)
+	// Next returns a slice that is only valid until OnTraffic returns; Decode copies it.
+	frame, err := c.Next(-1)
+	if err != nil {
+		return gnet.Close
+	}
 	req, err := conner.Decode(frame)
 	if err != nil {
-		return nil, gnet.Close
+		return gnet.Close
 	}
 	if req == nil {
-		return nil, gnet.None
+		return gnet.None
 	}
 
-	// Use ants pool to unblock the event-loop.
+	// Use the pool to unblock the event-loop.
 	s.pool.Submit(func() {
 		// handler
 		resp := runner.ProcessRequest(reporter, req)
 
 		// encode
-		out = conner.Encode(resp)
-		err := c.AsyncWrite(out)
-		if err != nil {
+		out := conner.Encode(resp)
+		if err := c.AsyncWrite(out, nil); err != nil {
 			panic(err)
 		}
 	})
-	return
+	return gnet.None
+}
+
+func (s *rpcServer) OnClose(c gnet.Conn, err error) (action gnet.Action) {
+	codec.RemoveConner(c)
+	return gnet.None
 }

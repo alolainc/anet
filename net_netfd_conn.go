@@ -14,7 +14,6 @@
 // limitations under the License.
 
 //go:build darwin || netbsd || freebsd || openbsd || dragonfly || linux
-// +build darwin netbsd freebsd openbsd dragonfly linux
 
 package anet
 
@@ -22,8 +21,11 @@ import (
 	"net"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/alolainc/anet/internal/logging"
 )
 
 var _ Conn = &netFD{}
@@ -35,9 +37,9 @@ func (c *netFD) Fd() (fd int) {
 
 // Read implements Conn.
 func (c *netFD) Read(b []byte) (n int, err error) {
-	n, err = syscall.Read(c.fd, b)
+	n, err = unix.Read(c.fd, b)
 	if err != nil {
-		if err == syscall.EAGAIN || err == syscall.EINTR {
+		if err == unix.EAGAIN || err == unix.EINTR {
 			return 0, nil
 		}
 	}
@@ -46,9 +48,9 @@ func (c *netFD) Read(b []byte) (n int, err error) {
 
 // Write implements Conn.
 func (c *netFD) Write(b []byte) (n int, err error) {
-	n, err = syscall.Write(c.fd, b)
+	n, err = unix.Write(c.fd, b)
 	if err != nil {
-		if err == syscall.EAGAIN {
+		if err == unix.EAGAIN {
 			return 0, nil
 		}
 	}
@@ -61,9 +63,9 @@ func (c *netFD) Close() (err error) {
 		return nil
 	}
 	if !c.detaching && c.fd > 2 {
-		err = syscall.Close(c.fd)
+		err = unix.Close(c.fd)
 		if err != nil {
-			logger.Printf("[anet]: netFD[%d] close error: %s", c.fd, err.Error())
+			logging.Printf("[anet]: netFD[%d] close error: %s", c.fd, err.Error())
 		}
 	}
 	return err

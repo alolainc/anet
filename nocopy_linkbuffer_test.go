@@ -14,7 +14,6 @@
 // limitations under the License.
 
 //go:build !windows
-// +build !windows
 
 package anet
 
@@ -22,8 +21,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"reflect"
 	"sync/atomic"
 	"testing"
+	"unsafe"
 )
 
 func TestLinkBuffer(t *testing.T) {
@@ -55,11 +56,13 @@ func TestLinkBuffer(t *testing.T) {
 	Equal(t, len(p), 28)
 	Equal(t, buf.Len(), 100)
 	MustNil(t, err)
+	MustTrue(t, buf.read.readExposed()) // single-node Next exposes buffer
 
 	p, err = buf.Peek(90)
 	Equal(t, len(p), 90)
 	Equal(t, buf.Len(), 100)
 	MustNil(t, err)
+	MustTrue(t, buf.read.readExposed()) // single-node Peek exposes buffer
 
 	read := buf.read
 	Equal(t, buf.head, head)
@@ -108,7 +111,6 @@ func TestLinkBufferGetBytes(t *testing.T) {
 		actualLen += len(bs[i])
 	}
 	Equal(t, actualLen, expectedLen)
-
 }
 
 // TestLinkBufferWithZero test more case with n is invalid.
@@ -250,6 +252,8 @@ func TestLinkBufferMultiNode(t *testing.T) {
 	Equal(t, buf.read.next.Len(), 7)
 	Equal(t, buf.flush.off, 0)
 	Equal(t, buf.flush.malloc, 7)
+	MustTrue(t, buf.read.readExposed())   // single-node Next
+	MustTrue(t, !buf.flush.readExposed()) // not touched yet
 
 	// Peek
 	p, _ = buf.Peek(4)
@@ -279,6 +283,7 @@ func TestLinkBufferMultiNode(t *testing.T) {
 	Equal(t, buf.read.Len(), 2)
 	Equal(t, buf.flush.off, 0)
 	Equal(t, buf.flush.malloc, 7)
+	MustTrue(t, !buf.flush.readExposed()) // multi-node Peek copies, doesn't expose
 	// Peek ends
 
 	buf.book(block8k, block8k)
@@ -350,6 +355,7 @@ func TestLinkBufferRefer(t *testing.T) {
 	Equal(t, buf.flush.off, 0)
 	Equal(t, buf.flush.malloc, 7)
 	Equal(t, cap(buf.flush.buf), 8)
+	MustTrue(t, buf.read.readExposed()) // single-node Next
 
 	// readv
 	_rbuf, err := buf.Slice(4)
@@ -397,11 +403,11 @@ func TestLinkBufferResetTail(t *testing.T) {
 	buf.WriteByte(except)
 	buf.Flush()
 	r1, _ := buf.Slice(1)
-	fmt.Printf("1: %x\n", buf.flush.buf)
+	t.Logf("1: %x\n", buf.flush.buf)
 	// 2. release & reset tail
 	buf.resetTail(LinkBufferCap)
 	buf.WriteByte(byte(2))
-	fmt.Printf("2: %x\n", buf.flush.buf)
+	t.Logf("2: %x\n", buf.flush.buf)
 
 	// check slice reader
 	got, _ := r1.ReadByte()
@@ -480,8 +486,8 @@ func TestLinkBufferWriteBinary(t *testing.T) {
 	LinkBufferCap = 8
 
 	// new b: cap=16, len=9
-	var b = make([]byte, 16)
-	var buf = NewLinkBuffer()
+	b := make([]byte, 16)
+	buf := NewLinkBuffer()
 	buf.WriteBinary(b[:9])
 	buf.Flush()
 
@@ -489,7 +495,7 @@ func TestLinkBufferWriteBinary(t *testing.T) {
 	// WriteBinary/Malloc etc. cannot start from b[9:]
 	buf.WriteBinary([]byte{1})
 	Equal(t, b[9], byte(0))
-	var bs, err = buf.Malloc(1)
+	bs, err := buf.Malloc(1)
 	MustNil(t, err)
 	bs[0] = 2
 	buf.Flush()
@@ -500,7 +506,7 @@ func TestLinkBufferWriteDirect(t *testing.T) {
 	// clean & new
 	LinkBufferCap = 32
 
-	var buf = NewLinkBuffer()
+	buf := NewLinkBuffer()
 	bt, _ := buf.Malloc(32)
 	bt[0] = 'a'
 	bt[1] = 'b'
@@ -523,107 +529,172 @@ func TestLinkBufferWriteDirect(t *testing.T) {
 	}
 }
 
-//func TestLinkBufferNoCopyWriteAndRead(t *testing.T) {
-//	// [origin_node:4096B] + [data_node:512B] + [new_node:16B] + [normal_node:4096B]
-//	const (
-//		mallocLen = 4096 * 2
-//		originLen = 4096
-//		dataLen   = 512
-//		newLen    = 16
-//		normalLen = 4096
-//	)
-//	buf := NewLinkBuffer()
-//	bt, _ := buf.Malloc(mallocLen)
-//	originBuf := bt[:originLen]
-//	newBuf := bt[originLen : originLen+newLen]
-//
-//	// write origin_node
-//	for i := 0; i < originLen; i++ {
-//		bt[i] = 'a'
-//	}
-//	// write data_node
-//	userBuf := make([]byte, dataLen)
-//	for i := 0; i < len(userBuf); i++ {
-//		userBuf[i] = 'b'
-//	}
-//	buf.WriteDirect(userBuf, mallocLen-originLen) // nocopy write
-//	// write new_node
-//	for i := 0; i < newLen; i++ {
-//		bt[originLen+i] = 'c'
-//	}
-//	buf.MallocAck(originLen + dataLen + newLen)
-//	buf.Flush()
-//	// write normal_node
-//	normalBuf, _ := buf.Malloc(normalLen)
-//	for i := 0; i < normalLen; i++ {
-//		normalBuf[i] = 'd'
-//	}
-//	buf.Flush()
-//	Equal(t, buf.Len(), originLen+dataLen+newLen+normalLen)
-//
-//	// copy read origin_node
-//	bt, _ = buf.ReadBinary(originLen)
-//	for i := 0; i < len(bt); i++ {
-//		MustTrue(t, bt[i] == 'a')
-//	}
-//	MustTrue(t, &bt[0] != &originBuf[0])
-//	// next read node is data node and must be readonly and non-reusable
-//	MustTrue(t, buf.read.next.getMode(readonlyMask) && !buf.read.next.reusable())
-//	// copy read data_node
-//	bt, _ = buf.ReadBinary(dataLen)
-//	for i := 0; i < len(bt); i++ {
-//		MustTrue(t, bt[i] == 'b')
-//	}
-//	MustTrue(t, &bt[0] != &userBuf[0])
-//	// copy read new_node
-//	bt, _ = buf.ReadBinary(newLen)
-//	for i := 0; i < len(bt); i++ {
-//		MustTrue(t, bt[i] == 'c')
-//	}
-//	MustTrue(t, &bt[0] != &newBuf[0])
-//	// current read node is the new node and must not be reusable
-//	newnode := buf.read
-//	t.Log("newnode", newnode.getMode(readonlyMask), newnode.getMode(nocopyReadMask))
-//	MustTrue(t, newnode.reusable())
-//	var nodeReleased int32
-//	runtime.SetFinalizer(&newnode.buf[0], func(_ *byte) {
-//		atomic.AddInt32(&nodeReleased, 1)
-//	})
-//	// nocopy read normal_node
-//	bt, _ = buf.ReadBinary(normalLen)
-//	for i := 0; i < len(bt); i++ {
-//		MustTrue(t, bt[i] == 'd')
-//	}
-//	MustTrue(t, &bt[0] == &normalBuf[0])
-//	// normal buffer never should be released
-//	runtime.SetFinalizer(&bt[0], func(_ *byte) {
-//		atomic.AddInt32(&nodeReleased, 1)
-//	})
-//	_ = buf.Release()
-//	MustTrue(t, newnode.buf == nil)
-//	for atomic.LoadInt32(&nodeReleased) == 0 {
-//		runtime.GC()
-//		t.Log("newnode release checking")
-//	}
-//	Equal(t, atomic.LoadInt32(&nodeReleased), int32(1))
-//	runtime.KeepAlive(normalBuf)
-//}
-
 func TestLinkBufferBufferMode(t *testing.T) {
 	bufnode := newLinkBufferNode(0)
-	MustTrue(t, !bufnode.getMode(nocopyReadMask))
-	MustTrue(t, bufnode.getMode(readonlyMask))
+	MustTrue(t, bufnode.getFlag(flagUnmanaged))
 	MustTrue(t, !bufnode.reusable())
+	MustTrue(t, !bufnode.readExposed())
 
 	bufnode = newLinkBufferNode(1)
-	MustTrue(t, !bufnode.getMode(nocopyReadMask))
-	MustTrue(t, !bufnode.getMode(readonlyMask))
-	bufnode.setMode(nocopyReadMask, false)
-	MustTrue(t, !bufnode.getMode(nocopyReadMask))
+	MustTrue(t, !bufnode.getFlag(flagUnmanaged))
 	MustTrue(t, bufnode.reusable())
-	bufnode.setMode(nocopyReadMask, true)
-	MustTrue(t, bufnode.getMode(nocopyReadMask))
-	MustTrue(t, !bufnode.reusable())
+	MustTrue(t, !bufnode.readExposed())
+}
+
+func TestLinkBufferReadCopy(t *testing.T) {
+	t.Run("SingleNode", func(t *testing.T) {
+		LinkBufferCap = 128
+		buf := NewLinkBuffer(128)
+		p, _ := buf.Malloc(16)
+		for i := range p {
+			p[i] = byte(i)
+		}
+		buf.Flush()
+
+		dst := make([]byte, 10)
+		n := buf.readCopy(dst)
+		Equal(t, n, 10)
+		for i := 0; i < 10; i++ {
+			Equal(t, dst[i], byte(i))
+		}
+		Equal(t, buf.Len(), 6)
+		// readCopy must not set readExposed
+		MustTrue(t, !buf.read.readExposed())
+	})
+
+	t.Run("MultiNode", func(t *testing.T) {
+		LinkBufferCap = 8
+		buf := NewLinkBuffer(8)
+		p, _ := buf.Malloc(8)
+		for i := range p {
+			p[i] = byte(i)
+		}
+		buf.Flush()
+		p, _ = buf.Malloc(8)
+		for i := range p {
+			p[i] = byte(i + 8)
+		}
+		buf.Flush()
+
+		dst := make([]byte, 16)
+		n := buf.readCopy(dst)
+		Equal(t, n, 16)
+		for i := 0; i < 16; i++ {
+			Equal(t, dst[i], byte(i))
+		}
+		Equal(t, buf.Len(), 0)
+	})
+
+	t.Run("PartialRead", func(t *testing.T) {
+		LinkBufferCap = 128
+		buf := NewLinkBuffer(128)
+		p, _ := buf.Malloc(4)
+		for i := range p {
+			p[i] = byte(i + 1)
+		}
+		buf.Flush()
+
+		// read more than available
+		dst := make([]byte, 16)
+		n := buf.readCopy(dst)
+		Equal(t, n, 4)
+		Equal(t, dst[0], byte(1))
+		Equal(t, dst[3], byte(4))
+		Equal(t, buf.Len(), 0)
+	})
+
+	t.Run("ReleasesNonExposedNodes", func(t *testing.T) {
+		LinkBufferCap = 8
+		buf := NewLinkBuffer(8)
+		buf.Malloc(8)
+		buf.Flush()
+		buf.Malloc(8)
+		buf.Flush()
+		node1 := buf.read
+
+		dst := make([]byte, 16)
+		buf.readCopy(dst)
+		// node1 was not exposed, should be released (head advanced past it)
+		MustTrue(t, buf.head != node1)
+	})
+
+	t.Run("SkipsExposedNodes", func(t *testing.T) {
+		LinkBufferCap = 8
+		buf := NewLinkBuffer(8)
+		p, _ := buf.Malloc(8)
+		for i := range p {
+			p[i] = byte(i)
+		}
+		buf.Flush()
+		buf.Malloc(8)
+		buf.Flush()
+
+		// expose node1 via Peek
+		buf.Peek(4)
+		node1 := buf.read
+		MustTrue(t, node1.readExposed())
+
+		// readCopy past both nodes
+		dst := make([]byte, 16)
+		n := buf.readCopy(dst)
+		Equal(t, n, 16)
+		Equal(t, dst[0], byte(0))
+		// head should stay at exposed node1
+		Equal(t, buf.head, node1)
+
+		// subsequent Release frees the exposed node
+		buf.Release()
+		MustTrue(t, buf.head != node1)
+	})
+
+	// [exposed/consumed] → [not-exposed/consumed] → [partial-consumed/read]
+	t.Run("ExposedThenNonExposedThenPartial", func(t *testing.T) {
+		LinkBufferCap = 8
+		buf := NewLinkBuffer(8)
+		// node1: 8 bytes
+		p, _ := buf.Malloc(8)
+		for i := range p {
+			p[i] = byte(i)
+		}
+		buf.Flush()
+		// node2: 8 bytes
+		p, _ = buf.Malloc(8)
+		for i := range p {
+			p[i] = byte(i + 8)
+		}
+		buf.Flush()
+		// node3: 8 bytes
+		p, _ = buf.Malloc(8)
+		for i := range p {
+			p[i] = byte(i + 16)
+		}
+		buf.Flush()
+
+		// expose node1 via Peek
+		buf.Peek(4)
+		node1 := buf.read
+		node2 := node1.next
+		MustTrue(t, node1.readExposed())
+		MustTrue(t, !node2.readExposed())
+
+		// readCopy 20 bytes: consumes node1(8) + node2(8) + 4 from node3
+		dst := make([]byte, 20)
+		n := buf.readCopy(dst)
+		Equal(t, n, 20)
+		for i := 0; i < 20; i++ {
+			Equal(t, dst[i], byte(i))
+		}
+		Equal(t, buf.Len(), 4)
+
+		// head should be node1 (exposed, kept in chain)
+		Equal(t, buf.head, node1)
+		// node2 was released, node1.next should skip to read (node3)
+		Equal(t, node1.next, buf.read)
+
+		// subsequent Release frees the exposed node
+		buf.Release()
+		MustTrue(t, buf.head == buf.read)
+	})
 }
 
 func BenchmarkLinkBufferConcurrentReadWrite(b *testing.B) {
@@ -682,13 +753,12 @@ func BenchmarkLinkBufferConcurrentReadWrite(b *testing.B) {
 				buf.Release()
 			}
 		}
-
 	})
 }
 
 func TestUnsafeStringToSlice(t *testing.T) {
 	s := "hello world"
-	bs := unsafeStringToSlice(s)
+	bs := unsafe.Slice(unsafe.StringData(s), len(s))
 	s = "hi, boy"
 	_ = s
 	Equal(t, string(bs), "hello world")
@@ -774,6 +844,34 @@ func TestLinkBufferPeekOutOfMemory(t *testing.T) {
 	}
 }
 
+func TestMallocAck(t *testing.T) {
+	sLen := 1024 * 7
+	buf1 := []byte{1, 2, 3, 4}
+	buf2 := []byte{5, 6, 7, 8}
+	lb := NewLinkBuffer(0)
+
+	buf, err := lb.Malloc(4 + sLen)
+	MustNil(t, err)
+	copy(buf[:4], buf1)
+	s := make([]byte, sLen)
+	err = lb.WriteDirect(s, sLen)
+	MustNil(t, err)
+
+	err = lb.MallocAck(4 + sLen)
+	MustNil(t, err)
+	lb.Flush()
+
+	buf, err = lb.Malloc(4)
+	MustNil(t, err)
+	copy(buf[:4], buf2)
+	lb.Flush()
+
+	buf, err = lb.Next(8 + sLen)
+	MustNil(t, err)
+
+	MustTrue(t, reflect.DeepEqual(buf, append(append(buf1, s...), buf2...)))
+}
+
 func BenchmarkStringToSliceByte(b *testing.B) {
 	b.StopTimer()
 	s := "hello world"
@@ -786,7 +884,7 @@ func BenchmarkStringToSliceByte(b *testing.B) {
 	b.ReportAllocs()
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
-		bs = unsafeStringToSlice(s)
+		bs = unsafe.Slice(unsafe.StringData(s), len(s))
 	}
 	_ = bs
 }
@@ -825,14 +923,14 @@ func BenchmarkLinkBufferPoolGet(b *testing.B) {
 }
 
 func BenchmarkCopyString(b *testing.B) {
-	var s = make([]byte, 128*1024)
+	s := make([]byte, 128*1024)
 
 	// benchmark
 	b.ReportAllocs()
 	b.SetParallelism(100)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		var v = make([]byte, 1024)
+		v := make([]byte, 1024)
 		for pb.Next() {
 			copy(v, s)
 		}
@@ -849,7 +947,7 @@ func BenchmarkLinkBufferNoCopyRead(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		var buffer = NewLinkBuffer(pagesize)
+		buffer := NewLinkBuffer(pagesize)
 		for pb.Next() {
 			buf, err := buffer.Malloc(totalSize)
 			if len(buf) != totalSize || err != nil {

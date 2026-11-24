@@ -1,17 +1,4 @@
 // Copyright 2024 Alola Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
@@ -20,7 +7,6 @@
 // All CloudWeGo Modifications are Copyright 2022 CloudWeGo authors.
 
 //go:build !windows
-// +build !windows
 
 package anet
 
@@ -28,7 +14,8 @@ import (
 	"context"
 	"errors"
 	"net"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // BUG(mikio): On JS, NaCl and Plan 9, methods and functions related
@@ -54,14 +41,14 @@ func (a *UnixAddr) opAddr() net.Addr {
 }
 
 func (a *UnixAddr) family() int {
-	return syscall.AF_UNIX
+	return unix.AF_UNIX
 }
 
-func (a *UnixAddr) sockaddr(family int) (syscall.Sockaddr, error) {
+func (a *UnixAddr) sockaddr(family int) (unix.Sockaddr, error) {
 	if a == nil {
 		return nil, nil
 	}
-	return &syscall.SockaddrUnix{Name: a.Name}, nil
+	return &unix.SockaddrUnix{Name: a.Name}, nil
 }
 
 func (a *UnixAddr) toLocal(net string) sockaddr {
@@ -129,11 +116,11 @@ func unixSocket(ctx context.Context, network string, laddr, raddr sockaddr, mode
 	var sotype int
 	switch network {
 	case "unix":
-		sotype = syscall.SOCK_STREAM
+		sotype = unix.SOCK_STREAM
 	case "unixgram":
-		sotype = syscall.SOCK_DGRAM
+		sotype = unix.SOCK_DGRAM
 	case "unixpacket":
-		sotype = syscall.SOCK_SEQPACKET
+		sotype = unix.SOCK_SEQPACKET
 	default:
 		return nil, net.UnknownNetworkError(network)
 	}
@@ -146,7 +133,7 @@ func unixSocket(ctx context.Context, network string, laddr, raddr sockaddr, mode
 		if raddr != nil && raddr.isWildcard() {
 			raddr = nil
 		}
-		if raddr == nil && (sotype != syscall.SOCK_DGRAM || laddr == nil) {
+		if raddr == nil && (sotype != unix.SOCK_DGRAM || laddr == nil) {
 			return nil, errMissingAddress
 		}
 	case "listen":
@@ -154,5 +141,5 @@ func unixSocket(ctx context.Context, network string, laddr, raddr sockaddr, mode
 		return nil, errors.New("unknown mode: " + mode)
 	}
 
-	return socket(ctx, network, syscall.AF_UNIX, sotype, 0, false, laddr, raddr)
+	return newSocketFD(ctx, network, unix.AF_UNIX, sotype, 0, false, laddr, raddr)
 }

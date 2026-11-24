@@ -14,33 +14,62 @@
 // limitations under the License.
 
 //go:build darwin || netbsd || freebsd || openbsd || dragonfly || linux
-// +build darwin netbsd freebsd openbsd dragonfly linux
 
 package anet
 
 import (
+	"context"
 	"errors"
 	"net"
 	"os"
 	"syscall"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/alolainc/anet/internal/socket"
 )
 
-// CreateListener return a new Listener.
-func CreateListener(network, addr string) (l Listener, err error) {
-	if network == "udp" {
-		// TODO: udp listener.
-		return udpListener(network, addr)
+// createReactorListener creates a Listener served by the pollers.
+func createReactorListener(network, addr string) (l Listener, err error) {
+	if network == "udp" || network == "udp4" || network == "udp6" {
+		return nil, Exception(ErrUnsupported, "UDP")
 	}
 	// tcp, tcp4, tcp6, unix
 	ln, err := net.Listen(network, addr)
 	if err != nil {
 		return nil, err
 	}
-	return ConvertListener(ln)
+	return convertReactorListener(ln)
 }
 
-// ConvertListener converts net.Listener to Listener
-func ConvertListener(l net.Listener) (nl Listener, err error) {
+// createReactorReusePortListener creates a TCP Listener with SO_REUSEPORT, so that more listeners can bind
+// the same address (see WithReusePort). Where the kernel does not balance SO_REUSEPORT sockets it creates a
+// plain listener, which the pollers then share.
+func createReactorReusePortListener(network, addr string) (Listener, error) {
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+	default:
+		return nil, Exception(ErrUnsupported, "SO_REUSEPORT on "+network)
+	}
+	if !socket.ReusePortBalances {
+		return createReactorListener(network, addr)
+	}
+	lc := net.ListenConfig{Control: func(_, _ string, rc syscall.RawConn) error {
+		var serr error
+		if err := rc.Control(func(fd uintptr) { serr = socket.ReusePort(int(fd)) }); err != nil {
+			return err
+		}
+		return serr
+	}}
+	ln, err := lc.Listen(context.Background(), network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return convertReactorListener(ln)
+}
+
+// convertReactorListener converts a net.Listener to a Listener served by the pollers.
+func convertReactorListener(l net.Listener) (nl Listener, err error) {
 	if tmp, ok := l.(Listener); ok {
 		return tmp, nil
 	}
@@ -51,46 +80,21 @@ func ConvertListener(l net.Listener) (nl Listener, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return ln, syscall.SetNonblock(ln.fd, true)
-}
-
-// TODO: udpListener does not work now.
-func udpListener(network, addr string) (l Listener, err error) {
-	ln := &listener{}
-	ln.pconn, err = net.ListenPacket(network, addr)
-	if err != nil {
-		return nil, err
-	}
-	ln.addr = ln.pconn.LocalAddr()
-	switch pconn := ln.pconn.(type) {
-	case *net.UDPConn:
-		ln.file, err = pconn.File()
-	}
-	if err != nil {
-		return nil, err
-	}
-	ln.fd = int(ln.file.Fd())
-	return ln, syscall.SetNonblock(ln.fd, true)
+	return ln, unix.SetNonblock(ln.fd, true)
 }
 
 var _ net.Listener = &listener{}
 
 type listener struct {
-	fd    int
-	addr  net.Addr       // listener's local addr
-	ln    net.Listener   // tcp|unix listener
-	pconn net.PacketConn // udp listener
-	file  *os.File
+	fd   int
+	addr net.Addr     // listener's local addr
+	ln   net.Listener // tcp|unix listener
+	file *os.File
 }
 
 // Accept implements Listener.
 func (ln *listener) Accept() (net.Conn, error) {
-	// udp
-	if ln.pconn != nil {
-		return ln.UDPAccept()
-	}
-	// tcp
-	var fd, sa, err = syscall.Accept(ln.fd)
+	fd, sa, err := socket.Accept(ln.fd)
 	if err != nil {
 		/* https://man7.org/linux/man-pages/man2/accept.2.html
 		EAGAIN or EWOULDBLOCK
@@ -100,12 +104,12 @@ func (ln *listener) Accept() (net.Conn, error) {
 		  not require these constants to have the same value, so a
 		  portable application should check for both possibilities.
 		*/
-		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 			return nil, nil
 		}
 		return nil, err
 	}
-	var nfd = &netFD{}
+	nfd := &netFD{}
 	nfd.fd = fd
 	nfd.localAddr = ln.addr
 	nfd.network = ln.addr.Network()
@@ -113,24 +117,16 @@ func (ln *listener) Accept() (net.Conn, error) {
 	return nfd, nil
 }
 
-// TODO: UDPAccept Not implemented.
-func (ln *listener) UDPAccept() (net.Conn, error) {
-	return nil, Exception(ErrUnsupported, "UDP")
-}
-
 // Close implements Listener.
 func (ln *listener) Close() error {
 	if ln.fd != 0 {
-		syscall.Close(ln.fd)
+		unix.Close(ln.fd)
 	}
 	if ln.file != nil {
 		ln.file.Close()
 	}
 	if ln.ln != nil {
 		ln.ln.Close()
-	}
-	if ln.pconn != nil {
-		ln.pconn.Close()
 	}
 	return nil
 }

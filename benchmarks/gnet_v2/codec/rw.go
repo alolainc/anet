@@ -38,6 +38,11 @@ func GetOrNewConner(conn gnet.Conn) *Conner {
 	return conner
 }
 
+// RemoveConner releases the per-connection decoder state when a connection closes.
+func RemoveConner(conn gnet.Conn) {
+	connermap.Delete(conn)
+}
+
 // encode
 func (c *Conner) Encode(msg *runner.Message) (out []byte) {
 	out = make([]byte, 4+len(msg.Message))

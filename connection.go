@@ -50,9 +50,11 @@ type Connection interface {
 	// A zero value for timeout means Writer will not timeout.
 	SetWriteTimeout(timeout time.Duration) error
 
-	// SetIdleTimeout sets the idle timeout of connections.
-	// Idle connections that exceed the set timeout are no longer guaranteed to be active,
-	// but can be checked by calling IsActive.
+	// SetIdleTimeout sets the idle timeout of connections by enabling TCP KeepAlive
+	// and setting the KeepAlive interval to the given timeout duration.
+	// NOTE: Despite its name, this does not track application-level idle time.
+	// It configures OS-level TCP KeepAlive to detect dead peers on idle connections.
+	// The name is kept for backward compatibility.
 	SetIdleTimeout(timeout time.Duration) error
 
 	// SetOnRequest can set or replace the OnRequest method for a connection, but can't be set to nil.
@@ -93,4 +95,29 @@ type Dialer interface {
 	DialConnection(network, address string, timeout time.Duration) (connection Connection, err error)
 
 	DialTimeout(network, address string, timeout time.Duration) (conn net.Conn, err error)
+}
+
+// SocketTuner is implemented by the connections of this package. It lets you tune the socket under a
+// Connection, with a type assertion:
+//
+//	if st, ok := conn.(anet.SocketTuner); ok {
+//		st.SetNotSentLowat(64 << 10)
+//	}
+//
+// These settings matter most for latency. TCP queues data in the kernel when the network is slow, and the
+// peer then receives it late. Keeping the kernel queue short moves that waiting into your own code, where
+// you can decide what to do with it (see Writer pending data, and the tee package).
+type SocketTuner interface {
+	// SetSendBuffer sets SO_SNDBUF in bytes. The kernel may adjust the value (Linux doubles it).
+	// A small send buffer bounds how much data sits in the kernel, but also limits throughput on
+	// links with a high bandwidth-delay product.
+	SetSendBuffer(n int) error
+	// SetRecvBuffer sets SO_RCVBUF in bytes.
+	SetRecvBuffer(n int) error
+	// SetNotSentLowat sets TCP_NOTSENT_LOWAT: a write is accepted only while less than n bytes are
+	// queued in the kernel and not yet sent. Unlike SO_SNDBUF it does not limit throughput, it only
+	// stops data piling up in front of the wire. Supported on Linux and darwin, otherwise ErrUnsupported.
+	SetNotSentLowat(n int) error
+	// PendingWrite returns the number of flushed bytes that have not been sent yet.
+	PendingWrite() int
 }

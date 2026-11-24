@@ -14,7 +14,6 @@
 // limitations under the License.
 
 //go:build !windows
-// +build !windows
 
 package anet
 
@@ -25,9 +24,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestDialerTCP(t *testing.T) {
@@ -65,47 +65,47 @@ func TestDialerTCP(t *testing.T) {
 	Equal(t, conn.RemoteAddr().String(), address)
 }
 
-// func TestDialerUnix(t *testing.T) {
-// 	dialer := NewDialer()
-// 	conn, err := dialer.DialTimeout("unix", "tmp.sock", time.Second)
-// 	MustTrue(t, err != nil)
-// 	MustTrue(t, conn.(*UnixConnection) == nil)
+func TestDialerUnix(t *testing.T) {
+	dialer := NewDialer()
+	conn, err := dialer.DialTimeout("unix", "tmp.sock", time.Second)
+	MustTrue(t, err != nil)
+	MustTrue(t, conn.(*UnixConnection) == nil)
 
-// 	ln, err := CreateListener("unix", "tmp.sock")
-// 	MustNil(t, err)
-// 	defer ln.Close()
+	ln, err := CreateListener("unix", "tmp.sock")
+	MustNil(t, err)
+	defer ln.Close()
 
-// 	stop := make(chan int, 1)
-// 	defer func() {
-// 		close(stop)
-// 		time.Sleep(time.Millisecond)
-// 	}()
+	stop := make(chan int, 1)
+	defer func() {
+		close(stop)
+		time.Sleep(time.Millisecond)
+	}()
 
-// 	go func() {
-// 		for {
-// 			select {
-// 			case <-stop:
-// 				err := ln.Close()
-// 				MustNil(t, err)
-// 				return
-// 			default:
-// 			}
-// 			conn, err := ln.Accept()
-// 			if conn == nil && err == nil {
-// 				continue
-// 			}
-// 		}
-// 	}()
+	go func() {
+		for {
+			select {
+			case <-stop:
+				err := ln.Close()
+				MustNil(t, err)
+				return
+			default:
+			}
+			conn, err := ln.Accept()
+			if conn == nil && err == nil {
+				continue
+			}
+		}
+	}()
 
-// 	conn, err = dialer.DialTimeout("unix", "tmp.sock", time.Second)
-// 	MustNil(t, err)
-// 	if runtime.GOOS == "linux" {
-// 		Equal(t, conn.LocalAddr().String(), "@")
-// 	} else {
-// 		Equal(t, conn.LocalAddr().String(), "")
-// 	}
-// 	Equal(t, conn.RemoteAddr().String(), "tmp.sock")
-// }
+	conn, err = dialer.DialTimeout("unix", "tmp.sock", time.Second)
+	MustNil(t, err)
+	if runtime.GOOS == "linux" {
+		Equal(t, conn.LocalAddr().String(), "@")
+	} else {
+		Equal(t, conn.LocalAddr().String(), "")
+	}
+	Equal(t, conn.RemoteAddr().String(), "tmp.sock")
+}
 
 func TestDialerFdAlloc(t *testing.T) {
 	address := getTestAddress()
@@ -119,7 +119,7 @@ func TestDialerFdAlloc(t *testing.T) {
 	go func() {
 		el1.Serve(ln)
 	}()
-	var ctx1, cancel1 = context.WithTimeout(context.Background(), time.Second)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel1()
 	defer el1.Shutdown(ctx1)
 
@@ -132,7 +132,7 @@ func TestDialerFdAlloc(t *testing.T) {
 			runtime.Gosched()
 		}
 		time.Sleep(time.Millisecond)
-		syscall.SetNonblock(fd, true)
+		unix.SetNonblock(fd, true)
 	}
 }
 
@@ -148,7 +148,7 @@ func TestFDClose(t *testing.T) {
 	go func() {
 		el1.Serve(ln)
 	}()
-	var ctx1, cancel1 = context.WithTimeout(context.Background(), time.Second)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel1()
 	defer el1.Shutdown(ctx1)
 
@@ -157,13 +157,13 @@ func TestFDClose(t *testing.T) {
 	conn, err = DialConnection("tcp", address, time.Second)
 	MustNil(t, err)
 	fd = conn.(*TCPConnection).fd
-	syscall.SetNonblock(fd, true)
+	unix.SetNonblock(fd, true)
 	conn.Close()
 
 	conn, err = DialConnection("tcp", address, time.Second)
 	MustNil(t, err)
 	fd = conn.(*TCPConnection).fd
-	syscall.SetNonblock(fd, true)
+	unix.SetNonblock(fd, true)
 	time.Sleep(time.Second)
 	conn.Close()
 }
@@ -178,7 +178,7 @@ func TestDialerThenClose(t *testing.T) {
 	go func() {
 		el1.Serve(ln1)
 	}()
-	var ctx1, cancel1 = context.WithTimeout(context.Background(), time.Second)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel1()
 	defer el1.Shutdown(ctx1)
 
@@ -188,7 +188,7 @@ func TestDialerThenClose(t *testing.T) {
 	go func() {
 		el2.Serve(ln2)
 	}()
-	var ctx2, cancel2 = context.WithTimeout(context.Background(), time.Second)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
 	defer cancel2()
 	defer el2.Shutdown(ctx2)
 
@@ -213,6 +213,21 @@ func TestDialerThenClose(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestNewFDConnection(t *testing.T) {
+	r, w := GetSysFdPairs()
+	rconn, err := NewFDConnection(r)
+	MustNil(t, err)
+	wconn, err := NewFDConnection(w)
+	MustNil(t, err)
+	_, err = rconn.Writer().WriteString("hello")
+	MustNil(t, err)
+	err = rconn.Writer().Flush()
+	MustNil(t, err)
+	buf, err := wconn.Reader().Next(5)
+	MustNil(t, err)
+	Equal(t, string(buf), "hello")
 }
 
 func mockDialerEventLoop(idx int) EventLoop {

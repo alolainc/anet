@@ -34,18 +34,24 @@ func Encode(writer anet.Writer, msg *runner.Message) (err error) {
 	return err
 }
 
-// decode
+// Decode reads one message without consuming anything until the whole frame is buffered.
+// In the default mode Peek waits for the data; with anet.WithInlineRequest it returns
+// anet.ErrNotEnoughData instead, and the caller should return to wait for more data.
 func Decode(reader anet.Reader, msg *runner.Message) (err error) {
-	bLen, err := reader.Next(4)
+	bLen, err := reader.Peek(4)
 	if err != nil {
 		return err
 	}
 	l := int(binary.BigEndian.Uint32(bLen))
-
+	if _, err = reader.Peek(4 + l); err != nil {
+		return err
+	}
+	if err = reader.Skip(4); err != nil {
+		return err
+	}
 	msg.Message, err = reader.ReadString(l)
 	if err != nil {
 		return err
 	}
-	err = reader.Release()
-	return err
+	return reader.Release()
 }

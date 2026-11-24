@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/alolainc/anet"
-	"github.com/alolainc/anet/pkg/mux"
+	"github.com/alolainc/anet/mux"
 
 	"github.com/alolainc/anet/benchmarks/anet/codec"
 	"github.com/alolainc/anet/benchmarks/runner"
